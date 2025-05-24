@@ -16,19 +16,27 @@ def send_telegram_message(message):
     }
     requests.post(url, data=data)
 
-def get_simulated_txf_data():
-    now = datetime.now().strftime("%H:%M:%S")
-    data = []
+def get_txf_1min_data():
+    url = "https://www.taifex.com.tw/cht/3/futDataDown"
+    payload = {
+        "down_type": "1",           # 分線
+        "commodity_id": "TXF",      # 小台期貨
+    }
+    try:
+        res = requests.post(url, data=payload)
+        df = pd.read_html(res.text)[0]
 
-    # 模擬一段布林資料
-    for i in range(19):
-        data.append([now, 20000 + i])  # 正常價格
-
-    # 最後一筆資料 = 觸碰上軌的價格
-    data.append([now, 20030])  # 模擬價格突破布林上緣
-
-    df = pd.DataFrame(data, columns=["time", "close"])
-    return df
+        # 清理資料格式
+        df.columns = ["時間", "成交價", "漲跌", "買價", "賣價", "成交量"]
+        df = df[["時間", "成交價"]]
+        df["time"] = pd.to_datetime(df["時間"]).dt.strftime("%H:%M:%S")
+        df["close"] = pd.to_numeric(df["成交價"], errors="coerce")
+        df = df.dropna()
+        df = df[["time", "close"]].reset_index(drop=True)
+        return df.tail(30)
+    except Exception as e:
+        print("資料抓取失敗:", e)
+        return pd.DataFrame(columns=["time", "close"])
 
 def compute_bollinger_bands(df, period=20, stddev=2):
     df['ma'] = df['close'].rolling(period).mean()
@@ -37,24 +45,32 @@ def compute_bollinger_bands(df, period=20, stddev=2):
     df['lower'] = df['ma'] - stddev * df['std']
     return df
 
-def main():
-    df = get_simulated_txf_data()
-    df = compute_bollinger_bands(df)
-    latest = df.iloc[-1]
-    price = latest['close']
-    upper = latest['upper']
-    lower = latest['lower']
+def monitor_loop():
+    while True:
+        df = get_txf_1min_data()
+        if df.empty or len(df) < 20:
+            print("資料不足，略過本次檢查")
+            time.sleep(5)
+            continue
 
-    message = f"📊 台指期 1 分鐘布林通道監控\n時間: {latest['time']}\n價格: {price:.2f}\n上軌: {upper:.2f}\n下軌: {lower:.2f}"
+        df = compute_bollinger_bands(df)
+        latest = df.iloc[-1]
+        price = latest['close']
+        upper = latest['upper']
+        lower = latest['lower']
 
-    if price >= upper:
-        message += "\n📈 價格觸碰布林【上軌】"
-    elif price <= lower:
-        message += "\n📉 價格觸碰布林【下軌】"
-    else:
-        message += "\n✅ 價格在布林通道內"
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        message = f"📊 台指期 1 分鐘布林通道監控\n時間：{now}\n當前價格：{price:.2f}"
 
-    send_telegram_message(message)
+        if price >= upper:
+            message += "\n📈 價格觸碰布林【上軌】"
+        elif price <= lower:
+            message += "\n📉 價格觸碰布林【下軌】"
+        else:
+            message += "\n✅ 價格在布林通道內"
+
+        send_telegram_message(message)
+        time.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    monitor_loop()
