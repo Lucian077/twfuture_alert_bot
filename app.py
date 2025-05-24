@@ -17,7 +17,6 @@ def send_telegram_message(message):
     requests.post(url, data=data)
 
 def get_simulated_txf_data():
-    def get_simulated_txf_data():
     now = datetime.now().strftime("%H:%M:%S")
     data = []
 
