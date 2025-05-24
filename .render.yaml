@@ -1,8 +1,8 @@
 services:
-  - type: cron
+  - type: web
     name: twfuture-alert-bot
-    runtime: python
-    schedule: "*/2 * * * *"
+    env: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
     envVars:
