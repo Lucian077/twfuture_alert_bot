@@ -17,17 +17,18 @@ def send_telegram_message(message):
     requests.post(url, data=data)
 
 def get_simulated_txf_data():
-    now = datetime.now()
+    def get_simulated_txf_data():
+    now = datetime.now().strftime("%H:%M:%S")
     data = []
-    base_price = 18700
-    for i in range(20):
-        t = now.replace(second=0, microsecond=0) - pd.Timedelta(minutes=19 - i)
-        close = base_price + np.random.randn() * 10
-        open_ = close + np.random.randn()
-        high = max(open_, close) + np.random.rand() * 5
-        low = min(open_, close) - np.random.rand() * 5
-        data.append([t, open_, high, low, close])
-    df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close"])
+
+    # 模擬一段布林資料
+    for i in range(19):
+        data.append([now, 20000 + i])  # 正常價格
+
+    # 最後一筆資料 = 觸碰上軌的價格
+    data.append([now, 20030])  # 模擬價格突破布林上緣
+
+    df = pd.DataFrame(data, columns=["time", "close"])
     return df
 
 def compute_bollinger_bands(df, period=20, stddev=2):
