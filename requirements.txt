@@ -4,3 +4,4 @@ numpy
 requests
 html5lib
 lxml
+beautifulsoup4
