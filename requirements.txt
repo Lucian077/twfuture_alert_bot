@@ -1,6 +1,6 @@
+flask
 pandas
 numpy
 requests
-python-telegram-bot
 html5lib
-flask
+lxml
