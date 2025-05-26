@@ -10,8 +10,8 @@ from bs4 import BeautifulSoup
 app = Flask(__name__)
 
 # Telegram bot 設定
-TELEGRAM_TOKEN = '你的 TELEGRAM BOT TOKEN'
-TELEGRAM_CHAT_ID = '你的 CHAT_ID'
+TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'
+TELEGRAM_CHAT_ID = '1190387445'
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
 last_signal = None  # 避免重複發送
