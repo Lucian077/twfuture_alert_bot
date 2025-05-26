@@ -23,7 +23,7 @@ def get_realtime_txf_data():
     url = "https://tw.stock.yahoo.com/future/real/MTX%26"
     headers = {"User-Agent": "Mozilla/5.0"}
     response = requests.get(url, headers=headers)
-    tables = pd.read_html(response.text)
+    tables = pd.read_html(response.text, flavor='html5lib')
     df = tables[0]
     df.columns = df.columns.droplevel(0)  # 移除多層欄位
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -56,18 +56,15 @@ def main():
             upper = latest['upper']
             lower = latest['lower']
 
-            message = f"📊 台指期即時監控\n時間：{latest['time']}\n價格：{price:.2f}"
-
             if pd.isna(upper) or pd.isna(lower):
-                message += "\n⚠️ 資料尚未足夠計算布林通道"
-            elif price >= upper:
-                message += "\n🚀 價格突破布林【上軌】"
-            elif price <= lower:
-                message += "\n📉 價格跌破布林【下軌】"
-            else:
-                message += "\n✅ 價格在布林通道內"
+                continue  # 尚未足夠資料就跳過
 
-            send_telegram_message(message)
+            if price >= upper:
+                message = f"🚀 台指期突破布林【上軌】\n時間：{latest['time']}\n價格：{price:.2f}"
+                send_telegram_message(message)
+            elif price <= lower:
+                message = f"📉 台指期跌破布林【下軌】\n時間：{latest['time']}\n價格：{price:.2f}"
+                send_telegram_message(message)
 
         except Exception as e:
             send_telegram_message(f"❌ 發生錯誤：{e}")
