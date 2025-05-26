@@ -1,82 +1,75 @@
-import pandas as pd
-import numpy as np
 import requests
-from datetime import datetime
+import pandas as pd
 import time
-import os
 from flask import Flask
+import threading
+from datetime import datetime
+import numpy as np
+import telegram
 
+# Telegram 設定
+BOT_TOKEN = '你的 Telegram Bot Token'
+CHAT_ID = '你的 Chat ID'
+bot = telegram.Bot(token=BOT_TOKEN)
+
+# Flask ping 保活
 app = Flask(__name__)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }
-    requests.post(url, data=data)
-
-def get_realtime_txf_data():
-    url = "https://tw.stock.yahoo.com/future/real/MTX%26"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers)
-    tables = pd.read_html(response.text, flavor='html5lib')
-    df = tables[0]
-    df.columns = df.columns.droplevel(0)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    price = float(df.iloc[0]["成交"])
-    return pd.DataFrame([[now, price]], columns=["time", "close"])
-
-def compute_bollinger_bands(df, period=20, stddev=2):
-    df['ma'] = df['close'].rolling(period).mean()
-    df['std'] = df['close'].rolling(period).std()
-    df['upper'] = df['ma'] + stddev * df['std']
-    df['lower'] = df['ma'] - stddev * df['std']
-    return df
-
-@app.route("/ping")
+@app.route('/ping')
 def ping():
-    return "pong"
+    return "pong", 200
 
-def main():
-    df_all = []
-    last_status = None
+def fetch_realtime_txf():
+    url = "https://tw.stock.yahoo.com/future/futures-intraday/TXF%26WTXO1?sid=TXF&bf=1"
+    try:
+        response = requests.get(url, timeout=10)
+        tables = pd.read_html(response.text, flavor='html5lib')
+        df = tables[1]
+        df.columns = ['時間', '買進', '賣出', '成交', '漲跌', '幅度', '單量', '總量', '未平倉', '內盤', '外盤']
+        df = df[df['成交'] != '-']
+        df['成交'] = df['成交'].str.replace(',', '').astype(float)
+        df['時間'] = pd.to_datetime(df['時間'])
+        df = df.sort_values(by='時間')
+        return df[['時間', '成交']]
+    except Exception as e:
+        print("❌ 抓取即時資料失敗：", e)
+        return None
+
+def check_bollinger_and_notify():
+    last_status = None  # 上一次的位置狀態：'upper', 'lower', 'inside'
 
     while True:
-        try:
-            df_new = get_realtime_txf_data()
-            df_all.append(df_new.iloc[0])
-            df = pd.DataFrame(df_all)
-            df = compute_bollinger_bands(df)
+        df = fetch_realtime_txf()
+        if df is None or len(df) < 20:
+            time.sleep(5)
+            continue
 
-            latest = df.iloc[-1]
-            price = latest['close']
-            upper = latest['upper']
-            lower = latest['lower']
+        close_prices = df['成交']
+        ma = close_prices.rolling(window=20).mean()
+        std = close_prices.rolling(window=20).std()
+        upper = ma + 2 * std
+        lower = ma - 2 * std
 
-            if pd.isna(upper) or pd.isna(lower):
-                continue
+        current_price = close_prices.iloc[-1]
+        upper_band = upper.iloc[-1]
+        lower_band = lower.iloc[-1]
+        current_time = df['時間'].iloc[-1].strftime("%Y-%m-%d %H:%M:%S")
 
-            if price >= upper and last_status != 'above':
-                message = f"🚀 台指期突破布林【上軌】\n時間：{latest['time']}\n價格：{price:.2f}"
-                send_telegram_message(message)
-                last_status = 'above'
-            elif price <= lower and last_status != 'below':
-                message = f"📉 台指期跌破布林【下軌】\n時間：{latest['time']}\n價格：{price:.2f}"
-                send_telegram_message(message)
-                last_status = 'below'
-            elif lower < price < upper:
-                last_status = 'inside'
-
-        except Exception as e:
-            send_telegram_message(f"❌ 發生錯誤：{e}")
+        if current_price > upper_band:
+            if last_status != 'upper':
+                bot.send_message(chat_id=CHAT_ID, text=f"📈 台指期突破布林上軌！\n時間：{current_time}\n價格：{current_price:.2f}")
+                last_status = 'upper'
+        elif current_price < lower_band:
+            if last_status != 'lower':
+                bot.send_message(chat_id=CHAT_ID, text=f"📉 台指期跌破布林下軌！\n時間：{current_time}\n價格：{current_price:.2f}")
+                last_status = 'lower'
+        else:
+            last_status = 'inside'
 
         time.sleep(5)
 
-if __name__ == "__main__":
-    from threading import Thread
-    Thread(target=main).start()
-    app.run(host="0.0.0.0", port=10000)
+# 執行背景執行緒監控
+threading.Thread(target=check_bollinger_and_notify, daemon=True).start()
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=10000)
