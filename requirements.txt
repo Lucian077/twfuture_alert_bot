@@ -1,5 +1,7 @@
 flask
 pandas
-requests
+numpy
 python-telegram-bot
 lxml
+html5lib
+requests
