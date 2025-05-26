@@ -1,78 +1,91 @@
 import requests
 import pandas as pd
-import time
-from flask import Flask
-import threading
-from datetime import datetime
 import numpy as np
-import telegram
+import time
+import threading
+from flask import Flask
 import os
 
-# Telegram 設定
-BOT_TOKEN = '你的 Telegram Bot Token'
+# === Telegram Bot 設定 ===
+TELEGRAM_TOKEN = '你的 Telegram Bot Token'
 CHAT_ID = '你的 Chat ID'
-bot = telegram.Bot(token=BOT_TOKEN)
 
-# Flask ping 保活
+# === 建立 Flask App ===
 app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return '台指期布林通道監控啟動中', 200
 
 @app.route('/ping')
 def ping():
-    return "pong", 200
+    return 'pong', 200
 
-def fetch_realtime_txf():
-    url = "https://tw.stock.yahoo.com/future/futures-intraday/TXF%26WTXO1?sid=TXF&bf=1"
+# === 發送 Telegram 訊息 ===
+def send_telegram_message(message):
+    url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
+    payload = {'chat_id': CHAT_ID, 'text': message}
     try:
-        response = requests.get(url, timeout=10)
-        tables = pd.read_html(response.text, flavor='html5lib')
-        df = tables[1]
-        df.columns = ['時間', '買進', '賣出', '成交', '漲跌', '幅度', '單量', '總量', '未平倉', '內盤', '外盤']
-        df = df[df['成交'] != '-']
-        df['成交'] = df['成交'].str.replace(',', '').astype(float)
-        df['時間'] = pd.to_datetime(df['時間'])
-        df = df.sort_values(by='時間')
-        return df[['時間', '成交']]
+        requests.post(url, data=payload)
     except Exception as e:
-        print("❌ 抓取即時資料失敗：", e)
+        print(f'發送錯誤：{e}')
+
+# === 擷取 Yahoo 奇摩 台指期 即時資料 ===
+def get_txf_price_from_yahoo():
+    url = 'https://tw.stock.yahoo.com/future/quote/MTX%3DF'
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    try:
+        response = requests.get(url, headers=headers)
+        tables = pd.read_html(response.text)
+        price_table = tables[0]
+        current_price = float(price_table.iloc[0, 1])
+        return current_price
+    except Exception as e:
+        print(f'❌ 發生錯誤：{e}')
+        send_telegram_message(f'❌ 發生錯誤：{e}')
         return None
 
-def check_bollinger_and_notify():
-    last_status = None
+# === 記錄過去價格供布林通道使用 ===
+price_history = []
 
+# === 通知狀態，避免重複通知 ===
+last_signal = None
+
+# === 主監控邏輯 ===
+def monitor():
+    global last_signal
     while True:
-        df = fetch_realtime_txf()
-        if df is None or len(df) < 20:
-            time.sleep(5)
-            continue
+        current_price = get_txf_price_from_yahoo()
+        if current_price:
+            price_history.append(current_price)
+            if len(price_history) > 20:
+                price_history.pop(0)
 
-        close_prices = df['成交']
-        ma = close_prices.rolling(window=20).mean()
-        std = close_prices.rolling(window=20).std()
-        upper = ma + 2 * std
-        lower = ma - 2 * std
+            if len(price_history) == 20:
+                prices = np.array(price_history)
+                mid = np.mean(prices)
+                std = np.std(prices)
+                upper = mid + 2 * std
+                lower = mid - 2 * std
 
-        current_price = close_prices.iloc[-1]
-        upper_band = upper.iloc[-1]
-        lower_band = lower.iloc[-1]
-        current_time = df['時間'].iloc[-1].strftime("%Y-%m-%d %H:%M:%S")
+                now = time.strftime("%Y-%m-%d %H:%M:%S")
 
-        if current_price > upper_band:
-            if last_status != 'upper':
-                bot.send_message(chat_id=CHAT_ID, text=f"📈 台指期突破布林上軌！\n時間：{current_time}\n價格：{current_price:.2f}")
-                last_status = 'upper'
-        elif current_price < lower_band:
-            if last_status != 'lower':
-                bot.send_message(chat_id=CHAT_ID, text=f"📉 台指期跌破布林下軌！\n時間：{current_time}\n價格：{current_price:.2f}")
-                last_status = 'lower'
-        else:
-            last_status = 'inside'
-
+                if current_price > upper and last_signal != 'above':
+                    msg = f"🚨 台指期突破布林上軌！\n時間：{now}\n價格：{current_price:.2f} > 上軌：{upper:.2f}"
+                    send_telegram_message(msg)
+                    last_signal = 'above'
+                elif current_price < lower and last_signal != 'below':
+                    msg = f"🚨 台指期跌破布林下軌！\n時間：{now}\n價格：{current_price:.2f} < 下軌：{lower:.2f}"
+                    send_telegram_message(msg)
+                    last_signal = 'below'
+                elif lower <= current_price <= upper:
+                    last_signal = 'inside'  # 不發送，只更新狀態
         time.sleep(5)
 
-# 背景執行
-threading.Thread(target=check_bollinger_and_notify, daemon=True).start()
+# === 背景執行監控 ===
+threading.Thread(target=monitor, daemon=True).start()
 
-# 正確啟動方式（讓 Render 可識別）
+# === 執行 Flask App ===
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
