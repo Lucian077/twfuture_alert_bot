@@ -1,4 +1,3 @@
-from datetime import datetime, timedelta
 import requests
 import pandas as pd
 import numpy as np
@@ -11,75 +10,81 @@ TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'
 TELEGRAM_CHAT_ID = '1190387445'
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
-# Flask 應用
+# Yahoo 台指期近月一網址
+URL = 'https://tw.stock.yahoo.com/future/charts.html?sid=WTX%26&sname=臺指期近一&mid=01&type=1'
+
+# 建立 Flask App 做 keep-alive
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return '布林通道監控服務運行中'
+    return 'OK'
 
-# Yahoo 台指期近月一 1 分 K 線資料
-YAHOO_URL = 'https://tw.stock.yahoo.com/_td-stock/api/resource/FinanceChartService.apis;fields=chart;symbol=WTX%26.F?type=1m&range=1d'
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36'
+}
 
-def fetch_data():
+last_status = None
+
+def fetch_price_table():
     try:
-        res = requests.get(YAHOO_URL, headers={'User-Agent': 'Mozilla/5.0'})
-        res.raise_for_status()
-        data = res.json()
-        timestamps = data['chart']['timestamp']
-        prices = data['chart']['indicators']['quote'][0]['close']
-        df = pd.DataFrame({
-            'datetime': pd.to_datetime(timestamps, unit='s') + timedelta(hours=8),
-            'close': prices
-        }).dropna()
-        return df
+        response = requests.get(URL, headers=HEADERS)
+        tables = pd.read_html(response.text)
+        for table in tables:
+            if '時間' in table.columns and '成交' in table.columns:
+                return table
+        return None
     except Exception as e:
-        print(f'❌ 發生錯誤：{e}')
-        return pd.DataFrame()
-
-def calculate_bollinger(df, period=20):
-    df['MA'] = df['close'].rolling(window=period).mean()
-    df['STD'] = df['close'].rolling(window=period).std()
-    df['Upper'] = df['MA'] + 2 * df['STD']
-    df['Lower'] = df['MA'] - 2 * df['STD']
-    return df
-
-last_notified_time = None
+        print(f"❌ 發生錯誤：{e}")
+        return None
 
 def monitor_bollinger():
-    global last_notified_time
-    df = fetch_data()
-    if df.empty or len(df) < 20:
-        return
+    global last_status
+    history = []
 
-    df = calculate_bollinger(df)
-    latest = df.iloc[-1]
-    price = latest['close']
-    upper = latest['Upper']
-    lower = latest['Lower']
-
-    now = datetime.now()
-    time_diff = (now - last_notified_time).total_seconds() if last_notified_time else None
-
-    if price >= upper or price <= lower:
-        if time_diff is None or time_diff >= 5:
-            message = (
-                f'📈 台指期突破布林通道\n'
-                f'時間：{latest["datetime"]}\n'
-                f'價格：{price:.2f}\n'
-                f'上緣：{upper:.2f}\n'
-                f'下緣：{lower:.2f}'
-            )
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-            last_notified_time = now
-
-# 背景監控
-def run_monitoring_loop():
     while True:
-        monitor_bollinger()
+        table = fetch_price_table()
+        if table is None:
+            time.sleep(5)
+            continue
+
+        table = table[['時間', '成交']].dropna()
+        table = table[::-1].reset_index(drop=True)
+        table['成交'] = pd.to_numeric(table['成交'], errors='coerce')
+        table = table.dropna()
+
+        history.extend(table['成交'].tolist())
+        history = history[-20:]
+
+        if len(history) < 20:
+            time.sleep(5)
+            continue
+
+        series = pd.Series(history)
+        ma = series.mean()
+        std = series.std()
+        upper = ma + 2 * std
+        lower = ma - 2 * std
+        current_price = history[-1]
+
+        status = 'in'
+        if current_price > upper:
+            status = 'above'
+        elif current_price < lower:
+            status = 'below'
+
+        if status != 'in' and status != last_status:
+            msg = f"⚠️ 台指期價格突破布林通道！\\n目前價格：{current_price}\\n上緣：{round(upper,2)} 下緣：{round(lower,2)}"
+            try:
+                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+                print("✅ 已通知 Telegram")
+            except Exception as e:
+                print(f"❌ 傳送 Telegram 通知失敗：{e}")
+        last_status = status
+
         time.sleep(5)
 
 if __name__ == '__main__':
     import threading
-    threading.Thread(target=run_monitoring_loop, daemon=True).start()
+    threading.Thread(target=monitor_bollinger).start()
     app.run(host='0.0.0.0', port=10000)
