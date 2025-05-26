@@ -1,100 +1,123 @@
+import os
 import time
 import requests
 import pandas as pd
 import numpy as np
 import telegram
 from flask import Flask
-from threading import Thread
+from datetime import datetime
+from bs4 import BeautifulSoup
 
 # Telegram 設定
 TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'
 TELEGRAM_CHAT_ID = '1190387445'
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
-# Flask App
+# 建立 Flask App 用於 keep-alive
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return 'OK'
+    return 'Service is running'
 
-# Yahoo 奇摩台指期近月一的網址
-URL = "https://tw.stock.yahoo.com/future/charts.html?sid=WTX%26&type=1"
+# Yahoo 奇摩期貨網址
+YAHOO_URL = "https://tw.stock.yahoo.com/future/futures-chart/WTXO1?period=1m"
 
-# 紀錄最後一次通知的時間
-last_notified_time = None
-
-def fetch_latest_1min_k():
+# 建立歷史資料初始化用
+def get_initial_kbars():
     headers = {
         "User-Agent": "Mozilla/5.0"
     }
-    res = requests.get(URL, headers=headers)
-    tables = pd.read_html(res.text, flavor="html5lib")
-    
-    for table in tables:
-        if table.shape[1] >= 6 and "時間" in table.columns:
-            df = table.copy()
-            df.columns = [col.strip() for col in df.columns]
-            df = df[["時間", "成交"]]
-            df.columns = ["Time", "Close"]
-            df = df.dropna()
-            df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-            df = df.dropna()
-            df = df.iloc[::-1].reset_index(drop=True)  # 時間順序由舊到新
-            return df
-    raise Exception("❌ 無法從 Yahoo 擷取到台指期近月一資料")
+    res = requests.get(YAHOO_URL, headers=headers)
+    soup = BeautifulSoup(res.text, 'html.parser')
+    scripts = soup.find_all('script')
+    for script in scripts:
+        if '__NUXT__=' in script.text:
+            json_data = script.text.split('__NUXT__=')[1].strip()
+            import json
+            data = json.loads(json_data)
+            try:
+                k_data = data['data'][0]['priceChart']['chart']['technical']['WTXO1']['1m']
+                df = pd.DataFrame(k_data)
+                df['t'] = pd.to_datetime(df['t'], unit='s') + pd.Timedelta(hours=8)
+                df = df.rename(columns={'t': 'time', 'c': 'close'})
+                df = df[['time', 'close']]
+                return df.tail(100)  # 初始化取 100 筆資料
+            except Exception as e:
+                print(f"❌ 初始化資料錯誤：{e}")
+    return pd.DataFrame()
 
-def compute_bollinger_bands(df, period=20, num_std=2):
-    df["MA"] = df["Close"].rolling(window=period).mean()
-    df["STD"] = df["Close"].rolling(window=period).std()
-    df["Upper"] = df["MA"] + num_std * df["STD"]
-    df["Lower"] = df["MA"] - num_std * df["STD"]
+# 計算布林通道
+def calculate_bollinger(df, period=20):
+    df['MA'] = df['close'].rolling(window=period).mean()
+    df['STD'] = df['close'].rolling(window=period).std()
+    df['Upper'] = df['MA'] + 2 * df['STD']
+    df['Lower'] = df['MA'] - 2 * df['STD']
     return df
 
-def monitor():
-    global last_notified_time
-    print("📈 開始監控台指期布林通道突破狀況...")
+# 發送 Telegram 訊息
+def send_telegram_message(text):
+    try:
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+    except Exception as e:
+        print(f"❌ 傳送通知失敗：{e}")
 
+# 主程式
+def monitor():
+    df = get_initial_kbars()
+    if df.empty:
+        print("❌ 無法初始化 K 線資料")
+        return
+    df = calculate_bollinger(df)
+
+    last_alert_time = None
     while True:
         try:
-            df = fetch_latest_1min_k()
-            if len(df) < 20:
-                print("資料不足，等待更多資料填滿布林通道...")
-                time.sleep(5)
-                continue
+            res = requests.get(YAHOO_URL, headers={"User-Agent": "Mozilla/5.0"})
+            soup = BeautifulSoup(res.text, 'html.parser')
+            scripts = soup.find_all('script')
+            for script in scripts:
+                if '__NUXT__=' in script.text:
+                    json_data = script.text.split('__NUXT__=')[1].strip()
+                    import json
+                    data = json.loads(json_data)
+                    k_data = data['data'][0]['priceChart']['chart']['technical']['WTXO1']['1m']
+                    latest = pd.DataFrame(k_data).tail(1)
+                    latest['t'] = pd.to_datetime(latest['t'], unit='s') + pd.Timedelta(hours=8)
+                    latest = latest.rename(columns={'t': 'time', 'c': 'close'})
+                    latest = latest[['time', 'close']]
 
-            df = compute_bollinger_bands(df)
-            latest = df.iloc[-1]
+                    df = pd.concat([df, latest]).drop_duplicates(subset='time', keep='last')
+                    df = df.tail(100).reset_index(drop=True)
+                    df = calculate_bollinger(df)
 
-            close = latest["Close"]
-            upper = latest["Upper"]
-            lower = latest["Lower"]
-            time_label = latest["Time"]
+                    now = df.iloc[-1]
+                    time_str = now['time'].strftime('%H:%M:%S')
+                    close = now['close']
+                    upper = now['Upper']
+                    lower = now['Lower']
 
-            # 每次都印出最新數據以方便除錯
-            print(f"[{time_label}] Close: {close}, Upper: {upper}, Lower: {lower}")
+                    print(f"[{time_str}] 價格: {close} | 上軌: {upper} | 下軌: {lower}")
 
-            # 判斷是否突破
-            if close > upper or close < lower:
-                if last_notified_time != time_label:
-                    message = f"⚠️ 台指期價格突破布林通道！\n時間：{time_label}\n價格：{close}\n上軌：{upper:.2f}\n下軌：{lower:.2f}"
-                    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-                    last_notified_time = time_label
-                    print("✅ 已發送通知")
-            else:
-                print("📊 價格在布林通道範圍內")
-
+                    if close > upper:
+                        send_telegram_message(f"🔺 [{time_str}] 價格突破上軌：{close:.2f} > {upper:.2f}")
+                    elif close < lower:
+                        send_telegram_message(f"🔻 [{time_str}] 價格跌破下軌：{close:.2f} < {lower:.2f}")
         except Exception as e:
             print(f"❌ 發生錯誤：{e}")
-
         time.sleep(5)
 
-# 執行背景監控執行緒
-def start_monitoring():
-    monitor_thread = Thread(target=monitor)
-    monitor_thread.daemon = True
-    monitor_thread.start()
+# 自動安裝缺少的套件
+def install_requirements():
+    try:
+        import bs4
+        import lxml
+    except:
+        os.system("pip install beautifulsoup4 lxml")
 
+# 開始運作
 if __name__ == '__main__':
-    start_monitoring()
+    install_requirements()
+    import threading
+    threading.Thread(target=monitor).start()
     app.run(host='0.0.0.0', port=10000)
