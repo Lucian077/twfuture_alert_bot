@@ -1,6 +1,8 @@
-Flask
+flask
 requests
 pandas
-python-telegram-bot==13.7
+numpy
+python-telegram-bot
 beautifulsoup4
+html5lib
 lxml
