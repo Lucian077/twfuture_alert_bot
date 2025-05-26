@@ -1,4 +1,5 @@
-flask
 pandas
 numpy
+flask
 requests
+html5lib
