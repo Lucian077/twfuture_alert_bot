@@ -6,6 +6,7 @@ import threading
 from datetime import datetime
 import numpy as np
 import telegram
+import os
 
 # Telegram 設定
 BOT_TOKEN = '你的 Telegram Bot Token'
@@ -36,7 +37,7 @@ def fetch_realtime_txf():
         return None
 
 def check_bollinger_and_notify():
-    last_status = None  # 上一次的位置狀態：'upper', 'lower', 'inside'
+    last_status = None
 
     while True:
         df = fetch_realtime_txf()
@@ -68,8 +69,10 @@ def check_bollinger_and_notify():
 
         time.sleep(5)
 
-# 執行背景執行緒監控
+# 背景執行
 threading.Thread(target=check_bollinger_and_notify, daemon=True).start()
 
+# 正確啟動方式（讓 Render 可識別）
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
