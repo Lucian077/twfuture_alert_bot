@@ -4,5 +4,5 @@ numpy
 lxml
 html5lib
 requests
-python-telegram-bot==13.15
 beautifulsoup4
+python-telegram-bot==13.7
