@@ -92,4 +92,7 @@ if __name__ == '__main__':
     t = threading.Thread(target=monitor_bollinger)
     t.daemon = True
     t.start()
-    app.run(host='0.0.0.0', port=10000)
+
+    import os
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
