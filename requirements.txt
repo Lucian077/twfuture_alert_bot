@@ -1,6 +1,5 @@
-Flask
+flask
 pandas
 requests
-beautifulsoup4
+python-telegram-bot
 lxml
-python-telegram-bot==13.7
