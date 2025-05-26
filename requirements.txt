@@ -1,8 +1,6 @@
 flask
 requests
 pandas
-numpy
-python-telegram-bot
 beautifulsoup4
-html5lib
 lxml
+python-telegram-bot==13.15
