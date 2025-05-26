@@ -1,98 +1,100 @@
+import time
 import requests
 import pandas as pd
-import time
+import numpy as np
 import telegram
-from datetime import datetime
 from flask import Flask
+from threading import Thread
 
 # Telegram 設定
 TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'
 TELEGRAM_CHAT_ID = '1190387445'
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
-# Yahoo 期貨資料網址（台指期近月一）
-YAHOO_URL = 'https://tw.screener.finance.yahoo.net/future/chartDataList.html?symbol=WTX&contractId=WTX&duration=1m'
-
-# 初始化 Flask App（用來保持 Render 運作）
+# Flask App
 app = Flask(__name__)
 
 @app.route('/')
-def index():
-    return '服務正常運作中'
+def home():
+    return 'OK'
 
-def fetch_kline():
-    """從 Yahoo 擷取 1 分鐘 K 線資料"""
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0'
-        }
-        response = requests.get(YAHOO_URL, headers=headers)
-        raw_data = response.json()
-        data = raw_data[0]['data']
-        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms') + pd.Timedelta(hours=8)
-        df.set_index('timestamp', inplace=True)
-        return df
-    except Exception as e:
-        print(f"❌ 發生錯誤：{e}")
-        return None
+# Yahoo 奇摩台指期近月一的網址
+URL = "https://tw.stock.yahoo.com/future/charts.html?sid=WTX%26&type=1"
 
-def calculate_bollinger(df, period=20, num_std=2):
-    """計算布林通道"""
-    df['MA'] = df['close'].rolling(window=period).mean()
-    df['STD'] = df['close'].rolling(window=period).std()
-    df['Upper'] = df['MA'] + num_std * df['STD']
-    df['Lower'] = df['MA'] - num_std * df['STD']
+# 紀錄最後一次通知的時間
+last_notified_time = None
+
+def fetch_latest_1min_k():
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+    res = requests.get(URL, headers=headers)
+    tables = pd.read_html(res.text, flavor="html5lib")
+    
+    for table in tables:
+        if table.shape[1] >= 6 and "時間" in table.columns:
+            df = table.copy()
+            df.columns = [col.strip() for col in df.columns]
+            df = df[["時間", "成交"]]
+            df.columns = ["Time", "Close"]
+            df = df.dropna()
+            df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+            df = df.dropna()
+            df = df.iloc[::-1].reset_index(drop=True)  # 時間順序由舊到新
+            return df
+    raise Exception("❌ 無法從 Yahoo 擷取到台指期近月一資料")
+
+def compute_bollinger_bands(df, period=20, num_std=2):
+    df["MA"] = df["Close"].rolling(window=period).mean()
+    df["STD"] = df["Close"].rolling(window=period).std()
+    df["Upper"] = df["MA"] + num_std * df["STD"]
+    df["Lower"] = df["MA"] - num_std * df["STD"]
     return df
 
-def monitor_bollinger():
-    print("📈 開始監控台指期布林通道（含夜盤）...")
-    notified = {'upper': False, 'lower': False}
+def monitor():
+    global last_notified_time
+    print("📈 開始監控台指期布林通道突破狀況...")
 
     while True:
-        df = fetch_kline()
-        if df is None or len(df) < 20:
-            time.sleep(5)
-            continue
+        try:
+            df = fetch_latest_1min_k()
+            if len(df) < 20:
+                print("資料不足，等待更多資料填滿布林通道...")
+                time.sleep(5)
+                continue
 
-        df = calculate_bollinger(df)
-        latest = df.iloc[-1]
+            df = compute_bollinger_bands(df)
+            latest = df.iloc[-1]
 
-        price = latest['close']
-        upper = latest['Upper']
-        lower = latest['Lower']
-        timestamp = latest.name.strftime('%Y-%m-%d %H:%M:%S')
+            close = latest["Close"]
+            upper = latest["Upper"]
+            lower = latest["Lower"]
+            time_label = latest["Time"]
 
-        message = None
+            # 每次都印出最新數據以方便除錯
+            print(f"[{time_label}] Close: {close}, Upper: {upper}, Lower: {lower}")
 
-        if price > upper:
-            if not notified['upper']:
-                message = f"📢 {timestamp} 台指期突破【布林上緣】\n現價：{price:.2f} > 上緣：{upper:.2f}"
-                notified['upper'] = True
-                notified['lower'] = False
-        elif price < lower:
-            if not notified['lower']:
-                message = f"📢 {timestamp} 台指期跌破【布林下緣】\n現價：{price:.2f} < 下緣：{lower:.2f}"
-                notified['lower'] = True
-                notified['upper'] = False
-        else:
-            notified = {'upper': False, 'lower': False}
+            # 判斷是否突破
+            if close > upper or close < lower:
+                if last_notified_time != time_label:
+                    message = f"⚠️ 台指期價格突破布林通道！\n時間：{time_label}\n價格：{close}\n上軌：{upper:.2f}\n下軌：{lower:.2f}"
+                    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+                    last_notified_time = time_label
+                    print("✅ 已發送通知")
+            else:
+                print("📊 價格在布林通道範圍內")
 
-        if message:
-            try:
-                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-                print(f"✅ 已通知：{message}")
-            except Exception as e:
-                print(f"❌ Telegram 發送失敗：{e}")
+        except Exception as e:
+            print(f"❌ 發生錯誤：{e}")
 
         time.sleep(5)
 
-if __name__ == '__main__':
-    import threading
-    t = threading.Thread(target=monitor_bollinger)
-    t.daemon = True
-    t.start()
+# 執行背景監控執行緒
+def start_monitoring():
+    monitor_thread = Thread(target=monitor)
+    monitor_thread.daemon = True
+    monitor_thread.start()
 
-    import os
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == '__main__':
+    start_monitoring()
+    app.run(host='0.0.0.0', port=10000)
