@@ -1,93 +1,87 @@
+from flask import Flask
+import threading
 import requests
 import pandas as pd
-import numpy as np
 import time
 import telegram
-import threading
-from flask import Flask
-from datetime import datetime
+from bs4 import BeautifulSoup
 
-# === 你的 Telegram Bot 設定 ===
+# === Telegram 設定 ===
 TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'
 TELEGRAM_CHAT_ID = '1190387445'
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
-# === 建立 Flask Web App ===
+# === 初始化 Flask ===
 app = Flask(__name__)
 
-@app.route('/')
-def index():
-    return '台指期布林通道監控機器人運行中'
+# === 發送通知用 ===
+last_signal = None  # 防止重複通知
 
-# === 抓取 Yahoo 台指期資料 ===
-def get_txf_data():
-    try:
-        url = "https://tw.stock.yahoo.com/futures/real-time/MTX%26"
-        res = requests.get(url)
-        tables = pd.read_html(res.text, flavor='html5lib')
-        df = tables[1]  # 第2張表通常是即時行情表
-        df.columns = df.columns.droplevel() if isinstance(df.columns, pd.MultiIndex) else df.columns
-        df = df[['時間', '成交價']]
-        df = df.rename(columns={'成交價': 'price', '時間': 'time'})
-        df = df.dropna()
-        df['price'] = pd.to_numeric(df['price'], errors='coerce')
-        df['time'] = pd.to_datetime(df['time'])
-        df = df.dropna()
-        return df.tail(20)
-    except Exception as e:
-        print(f"❌ 發生錯誤：{e}")
-        return None
+# === 取得 Yahoo 台指期 1分K ===
+def fetch_taifex_data():
+    url = 'https://tw.stock.yahoo.com/future/futures-chart?sid=WTX%26'
+    res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+    soup = BeautifulSoup(res.text, 'html.parser')
+    script_tags = soup.find_all("script")
+    for tag in script_tags:
+        if "ChartApi" in tag.text:
+            json_start = tag.text.find("[{\"timestamp\"")
+            json_end = tag.text.find("}]") + 2
+            raw_json = tag.text[json_start:json_end]
+            try:
+                df = pd.read_json(raw_json)
+                df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
+                df = df.rename(columns={
+                    "open": "開盤", "high": "最高", "low": "最低", "close": "收盤"
+                })
+                return df[["datetime", "開盤", "最高", "最低", "收盤"]].tail(60).reset_index(drop=True)
+            except Exception as e:
+                print(f"❌ JSON 解析錯誤：{e}")
+    return pd.DataFrame()
 
-# === 計算布林通道 ===
-def calculate_bollinger_bands(df):
-    df['MA20'] = df['price'].rolling(window=20).mean()
-    df['STD'] = df['price'].rolling(window=20).std()
-    df['Upper'] = df['MA20'] + 2 * df['STD']
-    df['Lower'] = df['MA20'] - 2 * df['STD']
-    return df
+# === 檢查突破布林通道邏輯 ===
+def check_bollinger_breakout():
+    global last_signal
+    df = fetch_taifex_data()
+    if df.empty or len(df) < 20:
+        print("資料不足，無法計算布林通道")
+        return
 
-# === 發送 Telegram 訊息 ===
-def send_telegram_message(message):
-    try:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-    except Exception as e:
-        print(f"❌ Telegram 發送錯誤：{e}")
+    df['MA20'] = df['收盤'].rolling(window=20).mean()
+    df['STD20'] = df['收盤'].rolling(window=20).std()
+    df['Upper'] = df['MA20'] + 2 * df['STD20']
+    df['Lower'] = df['MA20'] - 2 * df['STD20']
 
-# === 判斷是否突破上下緣 ===
-last_status = ""
+    latest = df.iloc[-1]
+    price = latest['收盤']
+    upper = latest['Upper']
+    lower = latest['Lower']
 
-def monitor_job():
-    global last_status
+    if price > upper and last_signal != 'break_up':
+        msg = f"📈 台指期突破上軌！\n價格：{price:.2f} > 上軌：{upper:.2f}"
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+        last_signal = 'break_up'
+
+    elif price < lower and last_signal != 'break_down':
+        msg = f"📉 台指期跌破下軌！\n價格：{price:.2f} < 下軌：{lower:.2f}"
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+        last_signal = 'break_down'
+
+# === 背景執行任務 ===
+def run_monitor():
     while True:
-        df = get_txf_data()
-        if df is not None and len(df) >= 20:
-            df = calculate_bollinger_bands(df)
-            latest = df.iloc[-1]
-            price = latest['price']
-            upper = latest['Upper']
-            lower = latest['Lower']
-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-            if price > upper:
-                if last_status != 'above':
-                    send_telegram_message(f"📈 台指期突破布林通道上緣！\n時間：{now}\n價格：{price:.2f} > 上緣：{upper:.2f}")
-                    last_status = 'above'
-            elif price < lower:
-                if last_status != 'below':
-                    send_telegram_message(f"📉 台指期跌破布林通道下緣！\n時間：{now}\n價格：{price:.2f} < 下緣：{lower:.2f}")
-                    last_status = 'below'
-            else:
-                last_status = 'inside'
+        try:
+            check_bollinger_breakout()
+        except Exception as e:
+            print(f"❌ 發生錯誤：{e}")
         time.sleep(5)
 
-# === 啟動監控背景任務 ===
-def start_monitor():
-    t = threading.Thread(target=monitor_job)
-    t.daemon = True
-    t.start()
+# === Keep Alive 用 ===
+@app.route('/')
+def home():
+    return "OK", 200
 
-start_monitor()
-
-# === 執行 Web 服務 ===
+# === 啟動背景執行緒 + Web 服務 ===
 if __name__ == '__main__':
+    threading.Thread(target=run_monitor, daemon=True).start()
     app.run(host='0.0.0.0', port=10000)
