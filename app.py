@@ -5,86 +5,90 @@ import time
 import telegram
 from flask import Flask
 
-# Telegram 設定
+# === Telegram 設定 ===
 TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'
 TELEGRAM_CHAT_ID = '1190387445'
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
-# Yahoo 台指期近月一網址
-URL = 'https://tw.stock.yahoo.com/future/charts.html?sid=WTX%26&sname=臺指期近一&mid=01&type=1'
-
-# 建立 Flask App 做 keep-alive
+# === Flask 設定（保持 Render 存活）===
 app = Flask(__name__)
+@app.route("/")
+def keep_alive():
+    return "Bot is running!"
 
-@app.route('/')
-def home():
-    return 'OK'
+# === Yahoo 台指期近月一的 URL ===
+YAHOO_URL = "https://tw.stock.yahoo.com/future/charts.html?sid=WTX&contractId=WTX%26"
 
+# === 自訂 headers 模擬瀏覽器 ===
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36'
+    "User-Agent": "Mozilla/5.0"
 }
 
-last_status = None
+# === 儲存上次通知狀態，避免重複通知 ===
+last_signal = None
 
-def fetch_price_table():
+# === 下載歷史資料並建立初始布林通道基準 ===
+def get_kline_data():
     try:
-        response = requests.get(URL, headers=HEADERS)
-        tables = pd.read_html(response.text)
-        for table in tables:
-            if '時間' in table.columns and '成交' in table.columns:
-                return table
-        return None
+        response = requests.get(YAHOO_URL, headers=HEADERS, timeout=10)
+        tables = pd.read_html(response.text, flavor='html5lib')
+        df = tables[1]  # 通常表格 1 是 1 分 K 線資料
+        df.columns = ['時間', '成交價', '漲跌', '單量', '總量', '未平倉']
+        df = df[['時間', '成交價']].dropna()
+        df['成交價'] = pd.to_numeric(df['成交價'], errors='coerce')
+        df = df.dropna()
+        df.reset_index(drop=True, inplace=True)
+        return df
     except Exception as e:
         print(f"❌ 發生錯誤：{e}")
         return None
 
-def monitor_bollinger():
-    global last_status
-    history = []
+# === 計算布林通道（20MA ± 2SD）===
+def calculate_bollinger(df):
+    df['MA20'] = df['成交價'].rolling(window=20).mean()
+    df['STD20'] = df['成交價'].rolling(window=20).std()
+    df['Upper'] = df['MA20'] + 2 * df['STD20']
+    df['Lower'] = df['MA20'] - 2 * df['STD20']
+    return df
 
+# === 發送 Telegram 訊息 ===
+def send_telegram_message(message):
+    try:
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+        print(f"✅ 已發送通知：{message}")
+    except Exception as e:
+        print(f"❌ 傳送 Telegram 訊息錯誤：{e}")
+
+# === 主邏輯迴圈 ===
+def monitor():
+    global last_signal
     while True:
-        table = fetch_price_table()
-        if table is None:
-            time.sleep(5)
-            continue
+        df = get_kline_data()
+        if df is not None and len(df) >= 20:
+            df = calculate_bollinger(df)
+            latest = df.iloc[-1]
+            price = latest['成交價']
+            upper = latest['Upper']
+            lower = latest['Lower']
+            timestamp = latest['時間']
 
-        table = table[['時間', '成交']].dropna()
-        table = table[::-1].reset_index(drop=True)
-        table['成交'] = pd.to_numeric(table['成交'], errors='coerce')
-        table = table.dropna()
-
-        history.extend(table['成交'].tolist())
-        history = history[-20:]
-
-        if len(history) < 20:
-            time.sleep(5)
-            continue
-
-        series = pd.Series(history)
-        ma = series.mean()
-        std = series.std()
-        upper = ma + 2 * std
-        lower = ma - 2 * std
-        current_price = history[-1]
-
-        status = 'in'
-        if current_price > upper:
-            status = 'above'
-        elif current_price < lower:
-            status = 'below'
-
-        if status != 'in' and status != last_status:
-            msg = f"⚠️ 台指期價格突破布林通道！\\n目前價格：{current_price}\\n上緣：{round(upper,2)} 下緣：{round(lower,2)}"
-            try:
-                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-                print("✅ 已通知 Telegram")
-            except Exception as e:
-                print(f"❌ 傳送 Telegram 通知失敗：{e}")
-        last_status = status
+            if price > upper:
+                if last_signal != 'upper':
+                    send_telegram_message(f"⚠️ [{timestamp}] 台指期觸碰布林通道上緣：{price:.2f}")
+                    last_signal = 'upper'
+            elif price < lower:
+                if last_signal != 'lower':
+                    send_telegram_message(f"⚠️ [{timestamp}] 台指期觸碰布林通道下緣：{price:.2f}")
+                    last_signal = 'lower'
+            else:
+                last_signal = None
 
         time.sleep(5)
 
-if __name__ == '__main__':
-    import threading
-    threading.Thread(target=monitor_bollinger).start()
-    app.run(host='0.0.0.0', port=10000)
+# === 在啟動時執行監控程式 ===
+import threading
+threading.Thread(target=monitor).start()
+
+# === 啟動 Flask App（保持 Render 存活）===
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
