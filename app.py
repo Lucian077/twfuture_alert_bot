@@ -1,105 +1,100 @@
-import requests
 import pandas as pd
+import requests
 import time
-import numpy as np
+import threading
 import telegram
 from flask import Flask
+from datetime import datetime
 
-app = Flask(__name__)
-
-# Telegram 設定（已自動帶入）
+# Telegram 設定
 TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'
 TELEGRAM_CHAT_ID = '1190387445'
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
-# 記錄是否已通知過，避免重複通知
-notified_upper = False
-notified_lower = False
+# Flask 伺服器
+app = Flask(__name__)
 
-# 抓取 Yahoo 台指期近月一資料
-def fetch_yahoo_future_data():
-    url = "https://tw.stock.yahoo.com/future/futures-chart?sid=WTX1&interval=1m"
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+@app.route('/')
+def index():
+    return 'OK'
+
+@app.route('/keep-alive')
+def keep_alive():
+    return 'I am alive', 200
+
+# Yahoo 期貨近月一網址
+URL = 'https://tw.stock.yahoo.com/future/futures-chart/WTX1?guccounter=1'
+
+# 儲存歷史資料
+history = []
+
+# 發送通知紀錄
+notified = {"upper": False, "lower": False}
+
+def fetch_data():
     try:
-        res = requests.get(url, headers=headers, timeout=10)
-        tables = pd.read_html(res.text, flavor='html5lib')
-        for table in tables:
-            if '時間' in table.columns and '成交' in table.columns:
-                df = table[['時間', '成交']].copy()
-                df = df[df['成交'].apply(lambda x: isinstance(x, (int, float)) or str(x).replace('.', '', 1).isdigit())]
-                df['成交'] = pd.to_numeric(df['成交'])
-                df['時間'] = pd.to_datetime(df['時間'], format='%H:%M')
-                df = df.sort_values('時間')
-                return df
-        raise ValueError("找不到正確的表格")
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(URL, headers=headers)
+        tables = pd.read_html(r.text)
+        df = tables[1]  # 第 2 張表是 1 分 K
+
+        df.columns = ['時間', '成交', '漲跌', '買價', '賣價', '單量', '總量']
+        df = df[['時間', '成交']]
+        df = df.dropna()
+        df['時間'] = pd.to_datetime(df['時間'])
+        df['成交'] = pd.to_numeric(df['成交'], errors='coerce')
+        df = df.dropna()
+
+        return df
     except Exception as e:
         print("❌ 發生錯誤：", e)
         return None
 
-# 計算布林通道上下緣
-def calculate_bollinger_bands(prices, period=20, num_std=2):
-    rolling_mean = prices.rolling(window=period).mean()
-    rolling_std = prices.rolling(window=period).std()
-    upper_band = rolling_mean + num_std * rolling_std
-    lower_band = rolling_mean - num_std * rolling_std
-    return rolling_mean, upper_band, lower_band
-
-# 初始化過去資料
-historical_data = None
-while historical_data is None or len(historical_data) < 20:
-    historical_data = fetch_yahoo_future_data()
-    if historical_data is None:
-        print("等待 Yahoo 資料...")
-        time.sleep(5)
-
-print("✅ 初始化完成，共取得 {} 筆資料".format(len(historical_data)))
-
-# 每 5 秒監控價格
-def monitor():
-    global notified_upper, notified_lower, historical_data
+def check_bollinger():
+    global history, notified
     while True:
-        new_data = fetch_yahoo_future_data()
-        if new_data is not None and not new_data.empty:
-            # 合併新舊資料，取最後 20 筆
-            combined = pd.concat([historical_data, new_data]).drop_duplicates('時間')
-            combined = combined.sort_values('時間').iloc[-20:]
-            historical_data = combined
+        df = fetch_data()
+        if df is not None and not df.empty:
+            history.extend(df.to_dict('records'))
 
-            prices = combined['成交']
-            ma, upper, lower = calculate_bollinger_bands(prices)
+            # 保留最近 60 筆資料（約 1 小時）
+            history = history[-60:]
 
-            current_price = prices.iloc[-1]
-            current_time = combined['時間'].iloc[-1].strftime("%H:%M")
+            hist_df = pd.DataFrame(history)
+            hist_df['成交'] = pd.to_numeric(hist_df['成交'])
 
-            if current_price > upper.iloc[-1]:
-                if not notified_upper:
-                    message = f"⚠️ [{current_time}] 台指期價格突破布林通道上緣\n價格：{current_price}\n上緣：{upper.iloc[-1]:.2f}"
-                    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-                    notified_upper = True
-                    notified_lower = False
-            elif current_price < lower.iloc[-1]:
-                if not notified_lower:
-                    message = f"⚠️ [{current_time}] 台指期價格跌破布林通道下緣\n價格：{current_price}\n下緣：{lower.iloc[-1]:.2f}"
-                    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-                    notified_lower = True
-                    notified_upper = False
-            else:
-                notified_upper = False
-                notified_lower = False
+            if len(hist_df) >= 20:
+                close = hist_df['成交']
+                ma = close.rolling(window=20).mean()
+                std = close.rolling(window=20).std()
+                upper = ma + 2 * std
+                lower = ma - 2 * std
+                latest = close.iloc[-1]
+
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 現價: {latest:.2f}, 上緣: {upper.iloc[-1]:.2f}, 下緣: {lower.iloc[-1]:.2f}")
+
+                if latest > upper.iloc[-1]:
+                    if not notified["upper"]:
+                        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🚨 台指期價格突破布林通道上緣！現價：{latest:.2f}")
+                        notified = {"upper": True, "lower": False}
+                elif latest < lower.iloc[-1]:
+                    if not notified["lower"]:
+                        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"⚠️ 台指期價格跌破布林通道下緣！現價：{latest:.2f}")
+                        notified = {"upper": False, "lower": True}
+                else:
+                    notified = {"upper": False, "lower": False}
 
         time.sleep(5)
 
-# 開始背景執行
-import threading
-threading.Thread(target=monitor, daemon=True).start()
+# 背景啟動
+def start_monitor():
+    thread = threading.Thread(target=check_bollinger)
+    thread.daemon = True
+    thread.start()
 
-# Flask keep-alive 用
-@app.route('/')
-def index():
-    return 'OK', 200
-
-# Render 專用啟動設定
+# 指定 Port 綁定
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+    start_monitor()
+    import os
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
