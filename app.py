@@ -25,7 +25,7 @@ def get_realtime_txf_data():
     response = requests.get(url, headers=headers)
     tables = pd.read_html(response.text, flavor='html5lib')
     df = tables[0]
-    df.columns = df.columns.droplevel(0)  # 移除多層欄位
+    df.columns = df.columns.droplevel(0)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     price = float(df.iloc[0]["成交"])
     return pd.DataFrame([[now, price]], columns=["time", "close"])
@@ -43,6 +43,7 @@ def ping():
 
 def main():
     df_all = []
+    last_status = None
 
     while True:
         try:
@@ -57,14 +58,18 @@ def main():
             lower = latest['lower']
 
             if pd.isna(upper) or pd.isna(lower):
-                continue  # 尚未足夠資料就跳過
+                continue
 
-            if price >= upper:
+            if price >= upper and last_status != 'above':
                 message = f"🚀 台指期突破布林【上軌】\n時間：{latest['time']}\n價格：{price:.2f}"
                 send_telegram_message(message)
-            elif price <= lower:
+                last_status = 'above'
+            elif price <= lower and last_status != 'below':
                 message = f"📉 台指期跌破布林【下軌】\n時間：{latest['time']}\n價格：{price:.2f}"
                 send_telegram_message(message)
+                last_status = 'below'
+            elif lower < price < upper:
+                last_status = 'inside'
 
         except Exception as e:
             send_telegram_message(f"❌ 發生錯誤：{e}")
