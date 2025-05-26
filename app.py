@@ -1,78 +1,95 @@
-import pandas as pd
 import requests
-import telegram
+import pandas as pd
 import time
+import telegram
+from datetime import datetime
 from flask import Flask
 
-# ===== Telegram 設定 =====
+# Telegram 設定
 TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'
 TELEGRAM_CHAT_ID = '1190387445'
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
-# ===== Flask keep-alive 設定 =====
+# Yahoo 期貨資料網址（台指期近月一）
+YAHOO_URL = 'https://tw.screener.finance.yahoo.net/future/chartDataList.html?symbol=WTX&contractId=WTX&duration=1m'
+
+# 初始化 Flask App（用來保持 Render 運作）
 app = Flask(__name__)
+
 @app.route('/')
 def index():
-    return 'Bot is running'
+    return '服務正常運作中'
 
-# ===== Yahoo 台指期近月一資料爬蟲網址（1分K） =====
-YAHOO_URL = "https://tw.stock.yahoo.com/_td-stock/api/resource/FinanceChartService;type=minute;range=1d;symbol=WTXF1.TW"
+def fetch_kline():
+    """從 Yahoo 擷取 1 分鐘 K 線資料"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0'
+        }
+        response = requests.get(YAHOO_URL, headers=headers)
+        raw_data = response.json()
+        data = raw_data[0]['data']
+        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms') + pd.Timedelta(hours=8)
+        df.set_index('timestamp', inplace=True)
+        return df
+    except Exception as e:
+        print(f"❌ 發生錯誤：{e}")
+        return None
 
-# ===== 初始歷史資料（最多補20筆） =====
-def get_kline_data():
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
-    res = requests.get(YAHOO_URL, headers=headers)
-    data = res.json()
-    prices = data['chart']['result'][0]['indicators']['quote'][0]['close']
-    times = data['chart']['result'][0]['timestamp']
-
-    df = pd.DataFrame({'time': pd.to_datetime(times, unit='s'), 'close': prices})
-    df = df.dropna()
-    return df.tail(20)
-
-# ===== 計算布林通道 =====
-def calc_bollinger(df):
-    df['MA20'] = df['close'].rolling(window=20).mean()
-    df['STD'] = df['close'].rolling(window=20).std()
-    df['Upper'] = df['MA20'] + 2 * df['STD']
-    df['Lower'] = df['MA20'] - 2 * df['STD']
+def calculate_bollinger(df, period=20, num_std=2):
+    """計算布林通道"""
+    df['MA'] = df['close'].rolling(window=period).mean()
+    df['STD'] = df['close'].rolling(window=period).std()
+    df['Upper'] = df['MA'] + num_std * df['STD']
+    df['Lower'] = df['MA'] - num_std * df['STD']
     return df
 
-# ===== 判斷是否突破布林通道 =====
-last_notified = None
-def check_breakout():
-    global last_notified
-    try:
-        df = get_kline_data()
-        df = calc_bollinger(df)
+def monitor_bollinger():
+    print("📈 開始監控台指期布林通道（含夜盤）...")
+    notified = {'upper': False, 'lower': False}
+
+    while True:
+        df = fetch_kline()
+        if df is None or len(df) < 20:
+            time.sleep(5)
+            continue
+
+        df = calculate_bollinger(df)
         latest = df.iloc[-1]
 
-        if latest['close'] > latest['Upper']:
-            msg = f"🚀 台指期突破上緣！\n價格：{latest['close']:.2f}"
-        elif latest['close'] < latest['Lower']:
-            msg = f"🔻 台指期跌破下緣！\n價格：{latest['close']:.2f}"
+        price = latest['close']
+        upper = latest['Upper']
+        lower = latest['Lower']
+        timestamp = latest.name.strftime('%Y-%m-%d %H:%M:%S')
+
+        message = None
+
+        if price > upper:
+            if not notified['upper']:
+                message = f"📢 {timestamp} 台指期突破【布林上緣】\n現價：{price:.2f} > 上緣：{upper:.2f}"
+                notified['upper'] = True
+                notified['lower'] = False
+        elif price < lower:
+            if not notified['lower']:
+                message = f"📢 {timestamp} 台指期跌破【布林下緣】\n現價：{price:.2f} < 下緣：{lower:.2f}"
+                notified['lower'] = True
+                notified['upper'] = False
         else:
-            return
+            notified = {'upper': False, 'lower': False}
 
-        if last_notified != msg:
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-            last_notified = msg
+        if message:
+            try:
+                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+                print(f"✅ 已通知：{message}")
+            except Exception as e:
+                print(f"❌ Telegram 發送失敗：{e}")
 
-    except Exception as e:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"❌ 發生錯誤：{e}")
-
-# ===== 每 5 秒監控一次 =====
-def start_monitor():
-    while True:
-        check_breakout()
         time.sleep(5)
 
-# ===== 開始 Flask 與監控 =====
 if __name__ == '__main__':
     import threading
-    t = threading.Thread(target=start_monitor)
+    t = threading.Thread(target=monitor_bollinger)
     t.daemon = True
     t.start()
     app.run(host='0.0.0.0', port=10000)
