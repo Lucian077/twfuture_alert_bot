@@ -121,3 +121,9 @@ if __name__ == '__main__':
     import threading
     threading.Thread(target=monitor).start()
     app.run(host='0.0.0.0', port=10000)
+
+
+# 印出最後幾筆 1 分 K 線資料
+print(df.tail())
+
+print(f"目前價格：{current_price}, 上緣：{upper_band}, 下緣：{lower_band}")
