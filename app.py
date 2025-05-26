@@ -1,78 +1,84 @@
-import time
+from flask import Flask
 import requests
 import pandas as pd
-import numpy as np
-from flask import Flask
+import time
 import threading
+import telegram
+from datetime import datetime
+from bs4 import BeautifulSoup
 
-# Telegram Bot 設定
-TELEGRAM_TOKEN = '你的 Bot Token'
-TELEGRAM_CHAT_ID = '你的 Chat ID'
-
-# Yahoo Finance 台指期網址（近月合約）
-YAHOO_URL = 'https://tw.stock.yahoo.com/future/q/txf/'
-
-# 建立 Flask app
 app = Flask(__name__)
 
-# 傳送 Telegram 通知
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }
-    try:
-        requests.post(url, data=data)
-    except Exception as e:
-        print(f"發送失敗：{e}")
+# Telegram bot 設定
+TELEGRAM_TOKEN = '你的 TELEGRAM BOT TOKEN'
+TELEGRAM_CHAT_ID = '你的 CHAT_ID'
+bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
-# 取得即時價格
-def get_realtime_price():
+last_signal = None  # 避免重複發送
+
+def fetch_txf_data():
     try:
-        tables = pd.read_html(YAHOO_URL, flavor='html5lib')
-        price_table = tables[2]  # 第三個表格通常是報價
-        price = float(price_table.iloc[0, 1].replace(',', ''))
-        return price
+        url = "https://tw.stock.yahoo.com/futures/real"  # 網址為即時期貨報價
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers)
+        soup = BeautifulSoup(response.text, "lxml")
+        price_tag = soup.find("span", {"data-test": "qsp-price"})
+        if price_tag:
+            return float(price_tag.text.replace(',', ''))
+        else:
+            print("找不到價格")
+            return None
     except Exception as e:
         print(f"❌ 發生錯誤：{e}")
         return None
 
-# 模擬 1 分鐘 K 線資料（實務上應替換為真實歷史 1 分鐘線資料來源）
-price_list = []
+def check_bollinger():
+    global last_signal
+    prices = []
 
-# 每 5 秒檢查突破
-def monitor_bollinger():
     while True:
-        price = get_realtime_price()
-        if price is not None:
-            price_list.append(price)
-            if len(price_list) > 20:
-                price_list.pop(0)
+        price = fetch_txf_data()
+        if price:
+            prices.append(price)
 
-            if len(price_list) >= 20:
-                series = pd.Series(price_list)
-                ma = series.rolling(window=20).mean().iloc[-1]
-                std = series.rolling(window=20).std().iloc[-1]
-                upper = ma + 2 * std
-                lower = ma - 2 * std
+            # 保留最後 20 筆價格計算布林通道
+            if len(prices) > 20:
+                prices = prices[-20:]
 
-                print(f"目前價格: {price}, 上軌: {upper}, 下軌: {lower}")
-                if price > upper:
-                    send_telegram_message(f"🚀 台指期突破上軌！價格：{price}")
-                elif price < lower:
-                    send_telegram_message(f"📉 台指期跌破下軌！價格：{price}")
+                df = pd.DataFrame(prices, columns=["price"])
+                df["MA20"] = df["price"].rolling(window=20).mean()
+                df["STD"] = df["price"].rolling(window=20).std()
+                df["Upper"] = df["MA20"] + 2 * df["STD"]
+                df["Lower"] = df["MA20"] - 2 * df["STD"]
+
+                current = df["price"].iloc[-1]
+                upper = df["Upper"].iloc[-1]
+                lower = df["Lower"].iloc[-1]
+
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                if current > upper and last_signal != "high":
+                    bot.send_message(chat_id=TELEGRAM_CHAT_ID,
+                                     text=f"📈 台指期突破上軌！\n時間：{now}\n價格：{current}")
+                    last_signal = "high"
+                elif current < lower and last_signal != "low":
+                    bot.send_message(chat_id=TELEGRAM_CHAT_ID,
+                                     text=f"📉 台指期跌破下軌！\n時間：{now}\n價格：{current}")
+                    last_signal = "low"
+                elif lower <= current <= upper:
+                    last_signal = None  # 回到正常狀態，下次突破會再通知
+
         time.sleep(5)
 
-# Ping route for Render
-@app.route("/ping")
-def ping():
-    return "pong", 200
+@app.route('/')
+def index():
+    return '台指期布林通道機器人運作中'
 
-# 啟動背景監控執行緒
-def start_monitoring():
-    threading.Thread(target=monitor_bollinger, daemon=True).start()
+def start_monitor():
+    t = threading.Thread(target=check_bollinger)
+    t.daemon = True
+    t.start()
 
-if __name__ == "__main__":
-    start_monitoring()
+if __name__ == '__main__':
+    start_monitor()
     app.run(host="0.0.0.0", port=10000)
