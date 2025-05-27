@@ -2,100 +2,107 @@ import os
 import requests
 import time
 import pandas as pd
-import numpy as np
-from datetime import datetime, time as dt_time
-import pytz
-import logging
-from flask import Flask, Response
+from datetime import datetime
+from flask import Flask
 
-# 初始化 Flask 应用 (必须放在最前面)
 app = Flask(__name__)
 
-# 配置端口 (Render 需要)
-PORT = int(os.environ.get("PORT", 10000))
+# 設定 Telegram 通知 (請替換成你的資訊)
+TELEGRAM_TOKEN = '你的Telegram_Bot_Token'
+TELEGRAM_CHAT_ID = '你的Chat_ID'
 
-# 设置台湾时区
-taipei_tz = pytz.timezone('Asia/Taipei')
+# 布林通道設定
+BOLLINGER_PERIOD = 20
+BOLLINGER_STD = 2
+CHECK_INTERVAL = 5  # 檢查間隔(秒)
 
-# 设置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+# 初始化變數
+historical_data = []
+last_alert = {'time': None, 'direction': None}
 
-# 环境变量配置
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-YAHOO_SYMBOL = os.getenv('YAHOO_SYMBOL', 'WTX=F')
-
-# 使用更可靠的 yfinance 替代 Yahoo API
-try:
-    import yfinance as yf
-    USE_YFINANCE = True
-except ImportError:
-    USE_YFINANCE = False
-    logger.warning("yfinance 未安装，将使用 Yahoo API")
-
-class TXFMonitor:
-    def __init__(self):
-        self.historical_data = []
-        self.ticker = yf.Ticker(YAHOO_SYMBOL) if USE_YFINANCE else None
-        self.last_alert_time = None
-        self.alert_cooldown = 300  # 5分钟冷却时间
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-
-    def get_txf_price(self):
-        """获取台指期价格 (使用 yfinance 或 Yahoo API)"""
-        try:
-            if USE_YFINANCE:
-                data = self.ticker.history(period='1d', interval='1m')
-                if not data.empty:
-                    latest = data.iloc[-1]
-                    return {
-                        'timestamp': latest.name.timestamp(),
-                        'close': latest['Close']
-                    }
-            else:
-                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{YAHOO_SYMBOL}?interval=1m"
-                response = self.session.get(url, timeout=10)
-                data = response.json()
-                
-                if data.get('chart', {}).get('result'):
-                    meta = data['chart']['result'][0]['meta']
-                    return {
-                        'timestamp': meta['regularMarketTime'],
-                        'close': meta['regularMarketPrice']
-                    }
-        except Exception as e:
-            logger.error(f"获取价格失败: {str(e)}")
+def get_price():
+    """從 Yahoo Finance 獲取台指期價格"""
+    try:
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ETWII?interval=1m"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        data = requests.get(url, headers=headers).json()
+        return {
+            'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'price': data['chart']['result'][0]['meta']['regularMarketPrice']
+        }
+    except:
+        print("獲取價格失敗")
         return None
 
-    # 保持其他方法不变 (calculate_bollinger_bands, send_telegram_alert, check_breakout 等)
+def calculate_bollinger():
+    """計算布林通道"""
+    df = pd.DataFrame(historical_data[-BOLLINGER_PERIOD:])
+    df['MA'] = df['price'].rolling(BOLLINGER_PERIOD).mean()
+    df['STD'] = df['price'].rolling(BOLLINGER_PERIOD).std()
+    return {
+        'upper': df['MA'].iloc[-1] + BOLLINGER_STD * df['STD'].iloc[-1],
+        'lower': df['MA'].iloc[-1] - BOLLINGER_STD * df['STD'].iloc[-1]
+    }
 
-# 初始化监控器
-monitor = TXFMonitor()
+def send_alert(message):
+    """發送 Telegram 通知"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message
+        })
+        print("已發送通知:", message)
+    except:
+        print("發送通知失敗")
+
+def monitor():
+    """主監控循環"""
+    print("系統啟動中...")
+    
+    # 初始化歷史數據
+    while len(historical_data) < BOLLINGER_PERIOD:
+        price = get_price()
+        if price:
+            historical_data.append(price)
+        time.sleep(1)
+    
+    print("開始監控...")
+    
+    while True:
+        price = get_price()
+        if not price:
+            time.sleep(CHECK_INTERVAL)
+            continue
+            
+        historical_data.append(price)
+        if len(historical_data) > 50:  # 限制數據量
+            historical_data.pop(0)
+        
+        bb = calculate_bollinger()
+        current_price = price['price']
+        
+        print(f"\n時間: {price['time']}")
+        print(f"價格: {current_price}")
+        print(f"布林通道: {bb['upper']:.2f} / {bb['lower']:.2f}")
+        
+        # 檢查突破
+        if current_price > bb['upper']:
+            if last_alert['direction'] != 'upper' or (time.time() - last_alert['time']) > 300:
+                send_alert(f"⚠️ 突破上軌!\n價格: {current_price}\n上軌: {bb['upper']:.2f}")
+                last_alert.update({'time': time.time(), 'direction': 'upper'})
+        elif current_price < bb['lower']:
+            if last_alert['direction'] != 'lower' or (time.time() - last_alert['time']) > 300:
+                send_alert(f"⚠️ 突破下軌!\n價格: {current_price}\n下軌: {bb['lower']:.2f}")
+                last_alert.update({'time': time.time(), 'direction': 'lower'})
+        
+        time.sleep(CHECK_INTERVAL)
 
 @app.route('/')
-def health_check():
-    return Response("台指期监控系统运行中", status=200)
-
-@app.route('/start_monitor')
-def start_monitor():
-    import threading
-    if not hasattr(app, 'monitor_thread'):
-        app.monitor_thread = threading.Thread(target=monitor.run_monitor)
-        app.monitor_thread.daemon = True
-        app.monitor_thread.start()
-    return Response("监控已启动", status=200)
+def home():
+    return "台指期監控系統運行中"
 
 if __name__ == '__main__':
-    # 启动Flask服务
-    from waitress import serve
-    serve(app, host="0.0.0.0", port=PORT)
+    import threading
+    threading.Thread(target=monitor, daemon=True).start()
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
