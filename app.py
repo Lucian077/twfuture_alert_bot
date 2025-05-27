@@ -1,92 +1,101 @@
 import requests
+import time
 import pandas as pd
 import numpy as np
-import time
-import telegram
-from flask import Flask
-from bs4 import BeautifulSoup
+from datetime import datetime
 
-# Telegram 設定
-TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'
-TELEGRAM_CHAT_ID = '1190387445'
-bot = telegram.Bot(token=TELEGRAM_TOKEN)
+# 設定
+BOLLINGER_PERIOD = 20  # 布林通道週期
+BOLLINGER_STD = 2      # 標準差倍數
+CHECK_INTERVAL = 5     # 檢查間隔(秒)
+TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'  # 請替換為自己的 Token
+TELEGRAM_CHAT_ID = '1190387445'  # 請替換為自己的 Chat ID
 
-# 初始化 Flask
-app = Flask(__name__)
+# Yahoo Finance API 設定
+YAHOO_SYMBOL = "WTX=F"  # 台指期近月代碼（Yahoo Finance 格式）
+YAHOO_API_URL = f"https://query1.finance.yahoo.com/v8/finance/chart/{YAHOO_SYMBOL}?interval=1m"
 
-@app.route('/')
-def keep_alive():
-    return 'OK'
+# 初始化歷史數據
+historical_data = []
 
-def fetch_tw_futures_data():
-    url = 'https://tw.stock.yahoo.com/future/1m/WTX%26'
-    headers = {
-        'User-Agent': 'Mozilla/5.0'
-    }
-
+def get_txf_price():
+    """從 Yahoo Finance 獲取台指期近月即時價格"""
     try:
-        res = requests.get(url, headers=headers)
-        dfs = pd.read_html(res.text)
-        df = dfs[0]
-
-        df.columns = ['時間', '成交價', '買進', '賣出', '成交量', '單量', '未平倉', '']
-        df = df.drop(columns=['', '買進', '賣出', '單量', '未平倉'])
-
-        df = df[df['成交價'] != '-']
-        df['成交價'] = df['成交價'].astype(float)
-        df = df[::-1].reset_index(drop=True)  # 時間順序排列
-        return df
-
+        response = requests.get(YAHOO_API_URL)
+        data = response.json()
+        
+        # 解析最新價格
+        latest_price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        latest_time = data["chart"]["result"][0]["meta"]["regularMarketTime"]
+        
+        return {
+            'timestamp': latest_time,
+            'close': latest_price
+        }
     except Exception as e:
-        print(f"❌ 發生錯誤：{e}")
+        print(f"獲取價格失敗: {e}")
         return None
 
-def calc_bollinger_band(prices, window=20, num_std=2):
-    rolling_mean = prices.rolling(window=window).mean()
-    rolling_std = prices.rolling(window=window).std()
-    upper_band = rolling_mean + (rolling_std * num_std)
-    lower_band = rolling_mean - (rolling_std * num_std)
-    return rolling_mean, upper_band, lower_band
+def calculate_bollinger_bands(data):
+    """計算布林通道"""
+    df = pd.DataFrame(data[-BOLLINGER_PERIOD:])
+    df['MA'] = df['close'].rolling(window=BOLLINGER_PERIOD).mean()
+    df['STD'] = df['close'].rolling(window=BOLLINGER_PERIOD).std()
+    df['Upper'] = df['MA'] + (df['STD'] * BOLLINGER_STD)
+    df['Lower'] = df['MA'] - (df['STD'] * BOLLINGER_STD)
+    return df.iloc[-1]
+
+def send_telegram_alert(message):
+    """發送 Telegram 通知"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message,
+            'parse_mode': 'Markdown'
+        })
+        print("Telegram 通知已發送")
+    except Exception as e:
+        print(f"發送通知失敗: {e}")
 
 def monitor():
-    notified = False
-
+    print("=== 台指期布林通道監控系統啟動 ===")
+    print("正在初始化歷史數據...")
+    
+    # 初始化 20 筆歷史數據
+    while len(historical_data) < BOLLINGER_PERIOD:
+        price_data = get_txf_price()
+        if price_data:
+            historical_data.append(price_data)
+        time.sleep(1)
+    
+    print("歷史數據初始化完成，開始監控...")
+    
     while True:
-        df = fetch_tw_futures_data()
-        if df is None or len(df) < 20:
-            print("⏳ 等待更多資料...")
-            time.sleep(5)
+        latest_data = get_txf_price()
+        if not latest_data:
+            time.sleep(CHECK_INTERVAL)
             continue
+        
+        historical_data.append(latest_data)
+        if len(historical_data) > BOLLINGER_PERIOD * 2:
+            historical_data.pop(0)
+        
+        bb = calculate_bollinger_bands(historical_data)
+        current_price = latest_data['close']
+        
+        print(f"\n時間: {datetime.fromtimestamp(latest_data['timestamp']).strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"當前價格: {current_price}")
+        print(f"布林通道: {bb['Upper']:.2f} | {bb['MA']:.2f} | {bb['Lower']:.2f}")
+        
+        if current_price > bb['Upper']:
+            alert_msg = f"*⚠️ 突破布林上軌!*\n價格: `{current_price}`\n上軌: `{bb['Upper']:.2f}`"
+            send_telegram_alert(alert_msg)
+        elif current_price < bb['Lower']:
+            alert_msg = f"*⚠️ 突破布林下軌!*\n價格: `{current_price}`\n下軌: `{bb['Lower']:.2f}`"
+            send_telegram_alert(alert_msg)
+        
+        time.sleep(CHECK_INTERVAL)
 
-        prices = df['成交價']
-        ma, upper, lower = calc_bollinger_band(prices)
-
-        latest_price = prices.iloc[-1]
-        latest_upper = upper.iloc[-1]
-        latest_lower = lower.iloc[-1]
-
-        print(f"🔍 時間：{df['時間'].iloc[-1]}｜價格：{latest_price}｜上緣：{latest_upper:.2f}｜下緣：{latest_lower:.2f}")
-
-        if latest_price > latest_upper:
-            if not notified:
-                msg = f"🔔 價格突破上緣！\n價格：{latest_price} > 上緣：{latest_upper:.2f}"
-                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-                print("✅ 已發送上緣通知")
-                notified = True
-
-        elif latest_price < latest_lower:
-            if not notified:
-                msg = f"🔔 價格跌破下緣！\n價格：{latest_price} < 下緣：{latest_lower:.2f}"
-                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-                print("✅ 已發送下緣通知")
-                notified = True
-
-        else:
-            notified = False  # 若未再突破，重設通知狀態
-
-        time.sleep(5)
-
-if __name__ == '__main__':
-    import threading
-    threading.Thread(target=monitor).start()
-    app.run(host='0.0.0.0', port=10000)
+if __name__ == "__main__":
+    monitor()
