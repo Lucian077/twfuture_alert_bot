@@ -8,3 +8,4 @@ yfinance
 waitress
 lxml
 html5lib
+beautifulsoup4
