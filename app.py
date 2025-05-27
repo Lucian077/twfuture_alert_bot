@@ -8,8 +8,8 @@ from flask import Flask
 app = Flask(__name__)
 
 # 設定 Telegram 通知 (請替換成你的資訊)
-TELEGRAM_TOKEN = '你的Telegram_Bot_Token'
-TELEGRAM_CHAT_ID = '你的Chat_ID'
+TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'
+TELEGRAM_CHAT_ID = '1190387445'
 
 # 布林通道設定
 BOLLINGER_PERIOD = 20
