@@ -26,70 +26,74 @@ last_alert = {'time': None, 'direction': None}
 last_price = None
 
 def get_price():
-    """從 Yahoo Finance 獲取台指期價格 (使用更可靠的API)"""
+    """獲取台指期價格 (使用更穩定的數據源)"""
     try:
-        # 使用更穩定的金融數據API
+        # 方法1: 使用公開的期貨API
         url = "https://api.finmindtrade.com/api/v4/data?"
         params = {
             'dataset': 'TaiwanFuturesTick',
             'data_id': 'TX',
-            'start_date': (datetime.now(taipei_tz) - timedelta(minutes=5)).strftime('%Y-%m-%d'),
-            'end_date': datetime.now(taipei_tz).strftime('%Y-%m-%d')
+            'start_date': (datetime.now(taipei_tz) - timedelta(minutes=30)).strftime('%Y-%m-%d'),
+            'token': 'free'  # 免費token
         }
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        
-        response = requests.get(url, params=params, headers=headers)
+        response = requests.get(url, params=params, timeout=5)
         data = response.json()
         
-        if data['status'] == 200 and len(data['data']) > 0:
+        if data.get('status') == 200 and len(data.get('data', [])) > 0:
             latest = data['data'][-1]
             return {
-                'time': datetime.strptime(latest['date'] + ' ' + latest['Time'], '%Y-%m-%d %H:%M:%S').astimezone(taipei_tz),
-                'price': latest['Close']
+                'time': datetime.strptime(f"{latest['date']} {latest['Time']}", '%Y-%m-%d %H:%M:%S').astimezone(taipei_tz),
+                'price': float(latest['Close'])
             }
-        else:
-            # 備用API
-            url = "https://mis.taifex.com.tw/futures/api/getQuoteList/TX"
-            data = requests.get(url).json()
-            if data['rtCode'] == 0:
-                latest = data['rtData'][0]
-                return {
-                    'time': datetime.now(taipei_tz),
-                    'price': float(latest['c'])
-                }
+        
+        # 方法2: 備用API (Yahoo Finance)
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ETWII?interval=1m&region=US"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        data = requests.get(url, headers=headers, timeout=5).json()
+        if 'chart' in data and 'result' in data['chart']:
+            meta = data['chart']['result'][0]['meta']
+            return {
+                'time': datetime.fromtimestamp(meta['regularMarketTime'], taipei_tz),
+                'price': meta['regularMarketPrice']
+            }
+            
     except Exception as e:
-        print(f"獲取價格失敗: {e}")
+        print(f"[{datetime.now(taipei_tz).strftime('%H:%M:%S')}] 獲取價格失敗: {str(e)}")
+    
     return None
 
 def calculate_bollinger():
     """計算布林通道"""
     if len(historical_data) < BOLLINGER_PERIOD:
-        return {'upper': 0, 'lower': 0}
+        return {'upper': 0, 'lower': 0, 'ma': 0}
     
     prices = [x['price'] for x in historical_data[-BOLLINGER_PERIOD:]]
     ma = pd.Series(prices).mean()
     std = pd.Series(prices).std()
     return {
-        'upper': ma + BOLLINGER_STD * std,
-        'lower': ma - BOLLINGER_STD * std
+        'upper': round(ma + BOLLINGER_STD * std, 2),
+        'lower': round(ma - BOLLINGER_STD * std, 2),
+        'ma': round(ma, 2)
     }
 
 def send_alert(message):
     """發送 Telegram 通知"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={
+        response = requests.post(url, json={
             'chat_id': TELEGRAM_CHAT_ID,
             'text': message,
             'parse_mode': 'Markdown'
-        })
-        print(f"{datetime.now(taipei_tz).strftime('%H:%M:%S')} 已發送通知")
+        }, timeout=5)
+        print(f"[{datetime.now(taipei_tz).strftime('%H:%M:%S')}] 已發送通知")
+        return True
     except Exception as e:
-        print(f"發送通知失敗: {e}")
+        print(f"[{datetime.now(taipei_tz).strftime('%H:%M:%S')}] 發送通知失敗: {str(e)}")
+        return False
 
 def monitor():
     """主監控循環"""
-    print(f"{datetime.now(taipei_tz).strftime('%Y-%m-%d %H:%M:%S')} 系統啟動中...")
+    print(f"[{datetime.now(taipei_tz).strftime('%Y-%m-%d %H:%M:%S')}] 系統啟動中...")
     
     # 初始化歷史數據
     while len(historical_data) < BOLLINGER_PERIOD:
@@ -97,7 +101,7 @@ def monitor():
         if price and (not last_price or price['price'] != last_price):
             historical_data.append(price)
             last_price = price['price']
-            print(f"初始化數據: {price['time'].strftime('%H:%M:%S')} - {price['price']}")
+            print(f"[{price['time'].strftime('%H:%M:%S')}] 初始化數據: {price['price']}")
         time.sleep(1)
     
     print("開始監控...")
@@ -113,30 +117,31 @@ def monitor():
             historical_data.append(price)
             last_price = price['price']
             
-            if len(historical_data) > 50:  # 限制數據量
+            if len(historical_data) > 50:
                 historical_data.pop(0)
             
             bb = calculate_bollinger()
             
-            print(f"\n時間: {price['time'].strftime('%Y-%m-%d %H:%M:%S')}")
-            print(f"價格: {price['price']}")
-            print(f"布林通道: {bb['upper']:.2f} / {bb['lower']:.2f}")
+            print(f"\n[{price['time'].strftime('%Y-%m-%d %H:%M:%S')}] 價格: {price['price']}")
+            print(f"布林通道: {bb['upper']} / {bb['ma']} / {bb['lower']}")
             
             # 檢查突破
             if price['price'] > bb['upper']:
-                if last_alert['direction'] != 'upper' or (time.time() - last_alert['time']) > 300:
-                    send_alert(f"⚠️ 突破上軌!\n時間: {price['time'].strftime('%H:%M:%S')}\n價格: {price['price']}\n上軌: {bb['upper']:.2f}")
-                    last_alert.update({'time': time.time(), 'direction': 'upper'})
+                if not last_alert['time'] or (time.time() - last_alert['time']) > 300 or last_alert['direction'] != 'upper':
+                    if send_alert(f"⚠️ *突破上軌!*\n時間: {price['time'].strftime('%H:%M:%S')}\n價格: `{price['price']}`\n上軌: `{bb['upper']}`"):
+                        last_alert.update({'time': time.time(), 'direction': 'upper'})
             elif price['price'] < bb['lower']:
-                if last_alert['direction'] != 'lower' or (time.time() - last_alert['time']) > 300:
-                    send_alert(f"⚠️ 突破下軌!\n時間: {price['time'].strftime('%H:%M:%S')}\n價格: {price['price']}\n下軌: {bb['lower']:.2f}")
-                    last_alert.update({'time': time.time(), 'direction': 'lower'})
+                if not last_alert['time'] or (time.time() - last_alert['time']) > 300 or last_alert['direction'] != 'lower':
+                    if send_alert(f"⚠️ *突破下軌!*\n時間: {price['time'].strftime('%H:%M:%S')}\n價格: `{price['price']}`\n下軌: `{bb['lower']}`"):
+                        last_alert.update({'time': time.time(), 'direction': 'lower'})
         
         time.sleep(CHECK_INTERVAL)
 
 @app.route('/')
 def home():
-    return f"台指期監控系統運行中<br>最後更新: {datetime.now(taipei_tz).strftime('%Y-%m-%d %H:%M:%S')}"
+    status = "運行中" if historical_data else "初始化中"
+    last_update = historical_data[-1]['time'].strftime('%Y-%m-%d %H:%M:%S') if historical_data else "無數據"
+    return f"台指期監控系統 {status}<br>最後更新: {last_update}"
 
 if __name__ == '__main__':
     import threading
