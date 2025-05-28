@@ -1,141 +1,125 @@
 import os
-import time
 import requests
+import time
 import pandas as pd
 from datetime import datetime, timedelta
 import pytz
 from flask import Flask
-from bs4 import BeautifulSoup
 
 app = Flask(__name__)
+
+# 設定台灣時區
+taipei_tz = pytz.timezone('Asia/Taipei')
 
 # Telegram 設定
 TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'
 TELEGRAM_CHAT_ID = '1190387445'
 
-# 時區與布林通道設定
-tz = pytz.timezone('Asia/Taipei')
-BOLL_PERIOD = 20
-BOLL_STD = 2
-INTERVAL = 5
+# 布林通道設定
+BOLLINGER_PERIOD = 20
+BOLLINGER_STD = 2
+CHECK_INTERVAL = 5  # 每幾秒檢查一次
 
-# 資料儲存
+# FinMind token（您的 token）
+FINMIND_TOKEN = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNS0wNS0yOCAwMDo0OToxNiIsInVzZXJfaWQiOiJMdWNpYW4wNzciLCJpcCI6IjExMS4yNTQuMTI5LjIzMSJ9.o90BDk2IcDf0hvbfRrnJTOey4NoMj_WvhTU_Kdto-EU'
+
 historical_data = []
 last_alert = {'time': None, 'direction': None}
 last_price = None
 
-def get_price_from_yahoo():
+def get_price():
     try:
-        url = "https://tw.stock.yahoo.com/futures/real/MTXF?contractCode=MTX%26MTXW1"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=10)
-        response.encoding = 'utf-8'
-        soup = BeautifulSoup(response.text, 'html.parser')
+        url = "https://api.finmindtrade.com/api/v4/data"
+        params = {
+            'dataset': 'TaiwanFuturesTick',
+            'data_id': 'TX',
+            'start_date': (datetime.now(taipei_tz) - timedelta(minutes=10)).strftime('%Y-%m-%d'),
+            'token': FINMIND_TOKEN
+        }
+        response = requests.get(url, params=params, timeout=5)
+        data = response.json()
 
-        table = soup.find('table', class_='Fz(1rem) Bdcl(c)')
-        if not table:
-            raise ValueError("No matching table found")
-
-        rows = table.find_all('tr')[1:]  # skip header
-        prices = []
-
-        for row in rows:
-            cols = row.find_all('td')
-            if len(cols) >= 6:
-                time_str = cols[0].text.strip()
-                price_str = cols[1].text.strip().replace(',', '')
-
-                if time_str and price_str:
-                    dt_str = datetime.now(tz).strftime('%Y-%m-%d') + ' ' + time_str
-                    dt = datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S').astimezone(tz)
-                    price = float(price_str)
-                    prices.append({'time': dt, 'price': price})
-
-        if prices:
-            return prices[-1]  # 最新一筆
+        if data.get('status') == 200 and len(data.get('data', [])) > 0:
+            latest = data['data'][-1]
+            return {
+                'time': datetime.strptime(f"{latest['date']} {latest['Time']}", '%Y-%m-%d %H:%M:%S').astimezone(taipei_tz),
+                'price': float(latest['Close'])
+            }
         else:
-            raise ValueError("No prices extracted")
-
+            print(f"[{datetime.now(taipei_tz).strftime('%H:%M:%S')}] 無法取得價格: API 無資料")
     except Exception as e:
-        print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] 無法取得價格: {e}")
-        return None
+        print(f"[{datetime.now(taipei_tz).strftime('%H:%M:%S')}] 無法取得價格: {e}")
+    return None
 
 def calculate_bollinger():
-    if len(historical_data) < BOLL_PERIOD:
+    if len(historical_data) < BOLLINGER_PERIOD:
         return {'upper': 0, 'lower': 0, 'ma': 0}
-    prices = [x['price'] for x in historical_data[-BOLL_PERIOD:]]
+    prices = [x['price'] for x in historical_data[-BOLLINGER_PERIOD:]]
     ma = pd.Series(prices).mean()
     std = pd.Series(prices).std()
     return {
-        'upper': round(ma + BOLL_STD * std, 2),
-        'lower': round(ma - BOLL_STD * std, 2),
+        'upper': round(ma + BOLLINGER_STD * std, 2),
+        'lower': round(ma - BOLLINGER_STD * std, 2),
         'ma': round(ma, 2)
     }
 
 def send_alert(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, json={
             'chat_id': TELEGRAM_CHAT_ID,
             'text': message,
             'parse_mode': 'Markdown'
         }, timeout=5)
-        print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] ✅ 已發送通知")
-        return True
+        print(f"[{datetime.now(taipei_tz).strftime('%H:%M:%S')}] 已發送通知")
     except Exception as e:
-        print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] ❌ 發送通知失敗: {e}")
-        return False
+        print(f"[{datetime.now(taipei_tz).strftime('%H:%M:%S')}] 發送通知失敗: {e}")
 
 def monitor():
     global last_price
-    print(f"[{datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')}] 系統啟動中...")
-
-    # 初始化歷史資料
-    while len(historical_data) < BOLL_PERIOD:
-        data = get_price_from_yahoo()
-        if data and (not last_price or data['price'] != last_price):
-            historical_data.append(data)
-            last_price = data['price']
-            print(f"[{data['time'].strftime('%H:%M:%S')}] 初始化價格: {data['price']}")
+    print(f"[{datetime.now(taipei_tz).strftime('%Y-%m-%d %H:%M:%S')}] 系統啟動中...")
+    while len(historical_data) < BOLLINGER_PERIOD:
+        price = get_price()
+        if price and (not last_price or price['price'] != last_price):
+            historical_data.append(price)
+            last_price = price['price']
+            print(f"[{price['time'].strftime('%H:%M:%S')}] 初始化數據: {price['price']}")
         time.sleep(1)
 
-    print("✅ 初始化完成，開始監控...")
-
+    print("開始監控...")
     while True:
-        data = get_price_from_yahoo()
-        if not data:
-            time.sleep(INTERVAL)
+        price = get_price()
+        if not price:
+            time.sleep(CHECK_INTERVAL)
             continue
 
-        if not last_price or data['price'] != last_price:
-            historical_data.append(data)
-            last_price = data['price']
+        if not last_price or price['price'] != last_price:
+            historical_data.append(price)
+            last_price = price['price']
             if len(historical_data) > 50:
                 historical_data.pop(0)
 
             bb = calculate_bollinger()
-            print(f"\n[{data['time'].strftime('%H:%M:%S')}] 價格: {data['price']}")
-            print(f"布林通道: 上軌={bb['upper']} 中軌={bb['ma']} 下軌={bb['lower']}")
+            print(f"\n[{price['time'].strftime('%Y-%m-%d %H:%M:%S')}] 價格: {price['price']}")
+            print(f"布林通道: 上軌={bb['upper']}, 中線={bb['ma']}, 下軌={bb['lower']}")
 
-            if data['price'] > bb['upper']:
-                if not last_alert['time'] or (time.time() - last_alert['time']) > 300 or last_alert['direction'] != 'upper':
-                    if send_alert(f"⚠️ *突破上軌!*\n時間: {data['time'].strftime('%H:%M:%S')}\n價格: `{data['price']}`\n上軌: `{bb['upper']}`"):
-                        last_alert.update({'time': time.time(), 'direction': 'upper'})
-
-            elif data['price'] < bb['lower']:
-                if not last_alert['time'] or (time.time() - last_alert['time']) > 300 or last_alert['direction'] != 'lower':
-                    if send_alert(f"⚠️ *跌破下軌!*\n時間: {data['time'].strftime('%H:%M:%S')}\n價格: `{data['price']}`\n下軌: `{bb['lower']}`"):
-                        last_alert.update({'time': time.time(), 'direction': 'lower'})
-
-        time.sleep(INTERVAL)
+            if price['price'] > bb['upper']:
+                if not last_alert['time'] or time.time() - last_alert['time'] > 300 or last_alert['direction'] != 'upper':
+                    send_alert(f"⚠️ *突破上軌!*\n時間: {price['time'].strftime('%H:%M:%S')}\n價格: `{price['price']}`\n上軌: `{bb['upper']}`")
+                    last_alert.update({'time': time.time(), 'direction': 'upper'})
+            elif price['price'] < bb['lower']:
+                if not last_alert['time'] or time.time() - last_alert['time'] > 300 or last_alert['direction'] != 'lower':
+                    send_alert(f"⚠️ *跌破下軌!*\n時間: {price['time'].strftime('%H:%M:%S')}\n價格: `{price['price']}`\n下軌: `{bb['lower']}`")
+                    last_alert.update({'time': time.time(), 'direction': 'lower'})
+        time.sleep(CHECK_INTERVAL)
 
 @app.route('/')
 def home():
-    status = "✅ 運行中" if historical_data else "⏳ 初始化中"
-    last_update = historical_data[-1]['time'].strftime('%Y-%m-%d %H:%M:%S') if historical_data else "尚無資料"
-    return f"<h3>台指期監控系統狀態</h3><p>{status}</p><p>最後更新: {last_update}</p>"
+    status = "運行中" if historical_data else "初始化中"
+    last_update = historical_data[-1]['time'].strftime('%Y-%m-%d %H:%M:%S') if historical_data else "無"
+    return f"台指期監控系統：{status}<br>最後更新時間：{last_update}"
 
 if __name__ == '__main__':
     import threading
     threading.Thread(target=monitor, daemon=True).start()
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
