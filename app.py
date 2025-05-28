@@ -1,3 +1,4 @@
+from bs4 import BeautifulSoup
 from flask import Flask
 import threading
 import time
