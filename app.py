@@ -44,7 +44,6 @@ def send_telegram_message(message):
         print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] Telegram 發送錯誤: {e}")
 
 # 抓取 Yahoo 奇摩「台指期近月一」1分K線
-def from bs4 import BeautifulSoup
 
 def fetch_yahoo_futures():
     url = "https://tw.stock.yahoo.com/futures/real/TXF"
