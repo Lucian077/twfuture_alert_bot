@@ -1,121 +1,93 @@
-from datetime import datetime, timedelta
-import pytz
+# app.py
+import time
 import requests
 import pandas as pd
+from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
+import pytz
 import numpy as np
-import time
-import threading
-from flask import Flask
 
-# --- 設定區 ---
-FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNS0wNS0yOCAwMDo0OToxNiIsInVzZXJfaWQiOiJMdWNpYW4wNzciLCJpcCI6IjExMS4yNTQuMTI5LjIzMSJ9.o90BDk2IcDf0hvbfRrnJTOey4NoMj_WvhTU_Kdto-EU"
-TELEGRAM_TOKEN = "7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8"
-CHAT_ID = "1190387445"
-CHECK_INTERVAL = 10  # 每 10 秒檢查一次
-tz = pytz.timezone("Asia/Taipei")
+# === Telegram 設定 ===
+TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'
+CHAT_ID = '1190387445'
 
-latest_price = None
-latest_update = "初始化中"
-status_lock = threading.Lock()
-
-# --- 函式區 ---
-def get_price():
-    try:
-        now = datetime.now(tz)
-        start_time = (now - timedelta(minutes=60)).strftime('%Y-%m-%d %H:%M:%S')
-        end_time = now.strftime('%Y-%m-%d %H:%M:%S')
-
-        payload = {
-            'dataset': 'TaiwanFuturesMinuteKBar',
-            'data_id': 'TXF',
-            'start_time': start_time,
-            'end_time': end_time,
-            'token': FINMIND_TOKEN
-        }
-
-        response = requests.get('https://api.finmindtrade.com/api/v4/data', params=payload)
-        data = response.json()
-
-        if not data.get('data'):
-            print(f"[{now.strftime('%H:%M:%S')}] 無法取得價格：API 無資料")
-            return None
-
-        df = pd.DataFrame(data['data'])
-        df['datetime'] = pd.to_datetime(df['datetime']).dt.tz_localize("UTC").dt.tz_convert(tz)
-        df.set_index('datetime', inplace=True)
-        df = df[['close']].copy()
-        df.columns = ['price']
-        return df
-
-    except Exception as e:
-        print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] 無法取得價格: {e}")
-        return None
-
-def calc_bollinger(df, window=20, num_std=2):
-    df['MA'] = df['price'].rolling(window=window).mean()
-    df['STD'] = df['price'].rolling(window=window).std()
-    df['Upper'] = df['MA'] + (num_std * df['STD'])
-    df['Lower'] = df['MA'] - (num_std * df['STD'])
-    return df
+# === 時區 ===
+tz = pytz.timezone('Asia/Taipei')
 
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {'chat_id': CHAT_ID, 'text': message}
-    requests.post(url, data=payload)
+    try:
+        requests.post(url, data=payload)
+    except Exception as e:
+        print(f"發送 Telegram 訊息失敗: {e}")
 
-def monitor():
-    global latest_price, latest_update
+def fetch_yahoo_txf_nearby1():
+    url = "https://tw.stock.yahoo.com/future/quote/TXF%26MTF1"
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+    try:
+        res = requests.get(url, headers=headers)
+        soup = BeautifulSoup(res.text, "html.parser")
+        table = soup.find("table")
+        rows = table.find_all("tr")[1:]
+        data = []
+        for row in rows:
+            cols = row.find_all("td")
+            if len(cols) < 2:
+                continue
+            time_str = cols[0].text.strip()
+            price_str = cols[1].text.strip().replace(",", "")
+            try:
+                price = float(price_str)
+                now = datetime.now(tz)
+                dt = datetime.strptime(time_str, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
+                dt = tz.localize(dt)
+                data.append((dt, price))
+            except:
+                continue
+        df = pd.DataFrame(data, columns=["datetime", "price"]).set_index("datetime")
+        return df
+    except Exception as e:
+        print(f"❌ 抓取失敗: {e}")
+        return None
 
-    while True:
-        df = get_price()
-        if df is None or len(df) < 20:
-            with status_lock:
-                latest_update = "無數據"
-            time.sleep(CHECK_INTERVAL)
-            continue
+def calculate_bollinger(df, window=20):
+    df['ma'] = df['price'].rolling(window).mean()
+    df['std'] = df['price'].rolling(window).std()
+    df['upper'] = df['ma'] + 2 * df['std']
+    df['lower'] = df['ma'] - 2 * df['std']
+    return df
 
-        df = calc_bollinger(df)
-        latest = df.iloc[-1]
-        price = latest['price']
-        upper = latest['Upper']
-        lower = latest['Lower']
-        ts = df.index[-1].strftime('%Y-%m-%d %H:%M:%S')
+# === 主迴圈 ===
+history_df = None
 
-        message = None
-        if price > upper:
-            message = f"⚠️ 價格突破上緣！\n時間：{ts}\n價格：{price:.2f}\n上緣：{upper:.2f}"
-        elif price < lower:
-            message = f"⚠️ 價格跌破下緣！\n時間：{ts}\n價格：{price:.2f}\n下緣：{lower:.2f}"
+while True:
+    df = fetch_yahoo_txf_nearby1()
+    if df is None or df.empty:
+        print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] 無法取得資料，稍後重試")
+        time.sleep(10)
+        continue
 
-        if message:
-            send_telegram_message(message)
-            print(f"[{ts}] 已發送通知：{message.replace(chr(10), ' | ')}")
-        else:
-            print(f"[{ts}] 價格正常：{price:.2f}，上緣：{upper:.2f}，下緣：{lower:.2f}")
+    # 累積歷史資料
+    if history_df is None:
+        history_df = df
+    else:
+        history_df = pd.concat([history_df, df])
+        history_df = history_df[~history_df.index.duplicated(keep='last')]
+        history_df = history_df.sort_index().last("60min")
 
-        with status_lock:
-            latest_price = price
-            latest_update = ts
+    history_df = calculate_bollinger(history_df)
+    latest = history_df.iloc[-1]
 
-        time.sleep(CHECK_INTERVAL)
+    # 顯示狀態
+    print(f"[{latest.name.strftime('%H:%M:%S')}] 價格: {latest.price}, 上軌: {latest.upper:.2f}, 下軌: {latest.lower:.2f}")
 
-# --- Web 狀態顯示 ---
-app = Flask(__name__)
+    # 判斷突破
+    if latest.price > latest.upper:
+        send_telegram_message(f"⚠️ 價格突破上軌！\n目前價格：{latest.price}\n時間：{latest.name.strftime('%H:%M:%S')}")
+    elif latest.price < latest.lower:
+        send_telegram_message(f"⚠️ 價格跌破下軌！\n目前價格：{latest.price}\n時間：{latest.name.strftime('%H:%M:%S')}")
 
-@app.route("/")
-def index():
-    with status_lock:
-        price = f"{latest_price:.2f}" if latest_price else "無"
-        return f"""
-        <h2>台指期布林通道監控系統</h2>
-        <p>狀態：監控中</p>
-        <p>最後更新時間：{latest_update}</p>
-        <p>最後價格：{price}</p>
-        """
-
-# --- 主程式 ---
-if __name__ == "__main__":
-    t = threading.Thread(target=monitor)
-    t.daemon = True
-    t.start()
-    app.run(host="0.0.0.0", port=10000)
+    time.sleep(10)
