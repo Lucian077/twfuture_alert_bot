@@ -1,93 +1,105 @@
-# app.py
+from flask import Flask
+import threading
 import time
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
-import pytz
 import numpy as np
+from datetime import datetime, timedelta
+import pytz
 
-# === Telegram 設定 ===
+# Telegram 設定
 TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'
 CHAT_ID = '1190387445'
 
-# === 時區 ===
-tz = pytz.timezone('Asia/Taipei')
+# 時區設定
+tz = pytz.timezone("Asia/Taipei")
 
+# 全域狀態變數
+status_message = "初始化中"
+last_update = "無數據"
+last_price = "無"
+
+# 建立 Flask App
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return f"""
+    <h2>台指期布林通道監控系統</h2>
+    狀態：{status_message}<br>
+    最後更新時間：{last_update}<br>
+    最後價格：{last_price}
+    """
+
+# 發送 Telegram 訊息
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {'chat_id': CHAT_ID, 'text': message}
+    data = {"chat_id": CHAT_ID, "text": message}
     try:
-        requests.post(url, data=payload)
+        response = requests.post(url, data=data)
+        if response.status_code != 200:
+            print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] Telegram 傳送失敗: {response.text}")
     except Exception as e:
-        print(f"發送 Telegram 訊息失敗: {e}")
+        print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] Telegram 發送錯誤: {e}")
 
-def fetch_yahoo_txf_nearby1():
-    url = "https://tw.stock.yahoo.com/future/quote/TXF%26MTF1"
+# 抓取 Yahoo 奇摩「台指期近月一」1分K線
+def fetch_yahoo_futures():
+    url = "https://tw.stock.yahoo.com/futures/real/MTX?col=last_trade&order=desc"  # 小型台指期替代網址，若抓不到可改 TXF
     headers = {
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
     }
     try:
-        res = requests.get(url, headers=headers)
-        soup = BeautifulSoup(res.text, "html.parser")
-        table = soup.find("table")
-        rows = table.find_all("tr")[1:]
-        data = []
-        for row in rows:
-            cols = row.find_all("td")
-            if len(cols) < 2:
-                continue
-            time_str = cols[0].text.strip()
-            price_str = cols[1].text.strip().replace(",", "")
-            try:
-                price = float(price_str)
-                now = datetime.now(tz)
-                dt = datetime.strptime(time_str, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
-                dt = tz.localize(dt)
-                data.append((dt, price))
-            except:
-                continue
-        df = pd.DataFrame(data, columns=["datetime", "price"]).set_index("datetime")
-        return df
+        response = requests.get(url, headers=headers)
+        dfs = pd.read_html(response.text)
+        for df in dfs:
+            if "成交價" in df.columns:
+                price = float(df.iloc[0]["成交價"])
+                return datetime.now(tz), price
     except Exception as e:
-        print(f"❌ 抓取失敗: {e}")
-        return None
+        print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] 無法取得價格: {e}")
+    return None, None
 
-def calculate_bollinger(df, window=20):
-    df['ma'] = df['price'].rolling(window).mean()
-    df['std'] = df['price'].rolling(window).std()
-    df['upper'] = df['ma'] + 2 * df['std']
-    df['lower'] = df['ma'] - 2 * df['std']
-    return df
+# 布林通道計算與通知邏輯
+def monitor():
+    global status_message, last_update, last_price
+    history = []
 
-# === 主迴圈 ===
-history_df = None
+    while True:
+        now, price = fetch_yahoo_futures()
+        if price:
+            history.append(price)
+            if len(history) > 100:
+                history.pop(0)
 
-while True:
-    df = fetch_yahoo_txf_nearby1()
-    if df is None or df.empty:
-        print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] 無法取得資料，稍後重試")
+            df = pd.Series(history)
+            ma = df.rolling(20).mean().iloc[-1]
+            std = df.rolling(20).std().iloc[-1]
+            upper = ma + 2 * std
+            lower = ma - 2 * std
+
+            last_update = now.strftime("%Y-%m-%d %H:%M:%S")
+            last_price = price
+            status_message = "執行中"
+
+            print(f"[{now.strftime('%H:%M:%S')}] 價格: {price}, 上緣: {round(upper)}, 下緣: {round(lower)}")
+
+            if price > upper:
+                send_telegram_message(f"📈 價格突破上緣！\n目前價格：{price}\n上緣：{round(upper)}")
+            elif price < lower:
+                send_telegram_message(f"📉 價格跌破下緣！\n目前價格：{price}\n下緣：{round(lower)}")
+
+        else:
+            status_message = "資料讀取失敗"
+            print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] 無法取得價格資料")
+
         time.sleep(10)
-        continue
 
-    # 累積歷史資料
-    if history_df is None:
-        history_df = df
-    else:
-        history_df = pd.concat([history_df, df])
-        history_df = history_df[~history_df.index.duplicated(keep='last')]
-        history_df = history_df.sort_index().last("60min")
+# 背景執行監控任務
+def start_monitor_thread():
+    thread = threading.Thread(target=monitor)
+    thread.daemon = True
+    thread.start()
 
-    history_df = calculate_bollinger(history_df)
-    latest = history_df.iloc[-1]
-
-    # 顯示狀態
-    print(f"[{latest.name.strftime('%H:%M:%S')}] 價格: {latest.price}, 上軌: {latest.upper:.2f}, 下軌: {latest.lower:.2f}")
-
-    # 判斷突破
-    if latest.price > latest.upper:
-        send_telegram_message(f"⚠️ 價格突破上軌！\n目前價格：{latest.price}\n時間：{latest.name.strftime('%H:%M:%S')}")
-    elif latest.price < latest.lower:
-        send_telegram_message(f"⚠️ 價格跌破下軌！\n目前價格：{latest.price}\n時間：{latest.name.strftime('%H:%M:%S')}")
-
-    time.sleep(10)
+if __name__ == "__main__":
+    start_monitor_thread()
+    app.run(host="0.0.0.0", port=10000)
