@@ -43,21 +43,36 @@ def send_telegram_message(message):
         print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] Telegram 發送錯誤: {e}")
 
 # 抓取 Yahoo 奇摩「台指期近月一」1分K線
+def from bs4 import BeautifulSoup
+
 def fetch_yahoo_futures():
-    url = "https://tw.stock.yahoo.com/futures/real/MTX?col=last_trade&order=desc"  # 小型台指期替代網址，若抓不到可改 TXF
+    url = "https://tw.stock.yahoo.com/futures/real/TXF"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        "User-Agent": "Mozilla/5.0"
     }
+
     try:
         response = requests.get(url, headers=headers)
-        dfs = pd.read_html(response.text)
-        for df in dfs:
-            if "成交價" in df.columns:
-                price = float(df.iloc[0]["成交價"])
-                return datetime.now(tz), price
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # 找到含「成交」文字的 td，往右邊找價格
+        td = soup.find("span", string="成交")
+        if td:
+            parent = td.find_parent("div")
+            if parent:
+                price_span = parent.find_next_sibling("div")
+                if price_span:
+                    price_text = price_span.text.replace(",", "")
+                    price = float(price_text)
+                    now = datetime.now(tz)
+                    return now, price
+
+        print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] 找不到成交價格")
+        return None, None
+
     except Exception as e:
-        print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] 無法取得價格: {e}")
-    return None, None
+        print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] Yahoo 抓取失敗: {e}")
+        return None, None
 
 # 布林通道計算與通知邏輯
 def monitor():
