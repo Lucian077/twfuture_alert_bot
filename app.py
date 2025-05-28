@@ -1,27 +1,26 @@
 import os
-import time
 import requests
+import time
 import pandas as pd
-from datetime import datetime
-from flask import Flask
+from datetime import datetime, timedelta
 import pytz
-import threading
+from flask import Flask
 
 app = Flask(__name__)
 
 # 台灣時區
 taipei_tz = pytz.timezone('Asia/Taipei')
 
-# Telegram 設定
+# Telegram 通知設定
 TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'
 TELEGRAM_CHAT_ID = '1190387445'
 
 # 布林通道參數
 BOLLINGER_PERIOD = 20
 BOLLINGER_STD = 2
-CHECK_INTERVAL = 5  # 每 5 秒檢查
+CHECK_INTERVAL = 5  # 秒
 
-# 全域變數
+# 初始化
 historical_data = []
 last_alert = {'time': None, 'direction': None}
 last_price = None
@@ -32,7 +31,9 @@ def get_price():
         url = "https://tw.stock.yahoo.com/future/realtime/TXF%261"
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, headers=headers, timeout=10)
-        dfs = pd.read_html(response.text)
+
+        # 使用 lxml 分析器讀取 HTML 表格
+        dfs = pd.read_html(response.text, flavor='lxml')
 
         for df in dfs:
             if '成交' in df.iloc[:, 0].astype(str).values or '成交價' in df.iloc[:, 0].astype(str).values:
@@ -46,7 +47,7 @@ def get_price():
 
     except Exception as e:
         print(f"[{datetime.now(taipei_tz).strftime('%H:%M:%S')}] 無法取得價格: {e}")
-    return None
+        return None
 
 def calculate_bollinger():
     """計算布林通道上下軌"""
@@ -66,17 +67,19 @@ def send_alert(message):
     """發送 Telegram 通知"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={
+        response = requests.post(url, json={
             'chat_id': TELEGRAM_CHAT_ID,
             'text': message,
             'parse_mode': 'Markdown'
         }, timeout=5)
-        print(f"[{datetime.now(taipei_tz).strftime('%H:%M:%S')}] ✅ 已發送通知")
+        print(f"[{datetime.now(taipei_tz).strftime('%H:%M:%S')}] 已發送通知")
+        return True
     except Exception as e:
-        print(f"[{datetime.now(taipei_tz).strftime('%H:%M:%S')}] ❌ 發送通知失敗: {e}")
+        print(f"[{datetime.now(taipei_tz).strftime('%H:%M:%S')}] 發送通知失敗: {e}")
+        return False
 
 def monitor():
-    """主監控邏輯"""
+    """主監控循環"""
     global last_price
 
     print(f"[{datetime.now(taipei_tz).strftime('%Y-%m-%d %H:%M:%S')}] 系統啟動中...")
@@ -87,10 +90,10 @@ def monitor():
         if price and (not last_price or price['price'] != last_price):
             historical_data.append(price)
             last_price = price['price']
-            print(f"[{price['time'].strftime('%H:%M:%S')}] 初始化: {price['price']}")
+            print(f"[{price['time'].strftime('%H:%M:%S')}] 初始化價格: {price['price']}")
         time.sleep(1)
 
-    print("✅ 開始監控...")
+    print("✅ 監控啟動中...")
 
     while True:
         price = get_price()
@@ -108,27 +111,27 @@ def monitor():
             bb = calculate_bollinger()
 
             print(f"\n[{price['time'].strftime('%Y-%m-%d %H:%M:%S')}] 價格: {price['price']}")
-            print(f"布林通道 ➤ 上: {bb['upper']} | 中: {bb['ma']} | 下: {bb['lower']}")
+            print(f"布林通道 ➤ 上: {bb['upper']}  中: {bb['ma']}  下: {bb['lower']}")
 
-            # 判斷突破
+            # 通知判斷
             if price['price'] > bb['upper']:
                 if not last_alert['time'] or (time.time() - last_alert['time']) > 300 or last_alert['direction'] != 'upper':
-                    send_alert(f"⚠️ *突破上軌!*\n時間: {price['time'].strftime('%H:%M:%S')}\n價格: `{price['price']}`\n上軌: `{bb['upper']}`")
-                    last_alert.update({'time': time.time(), 'direction': 'upper'})
-
+                    if send_alert(f"⚠️ *突破上軌！*\n時間: {price['time'].strftime('%H:%M:%S')}\n價格: `{price['price']}`\n上軌: `{bb['upper']}`"):
+                        last_alert.update({'time': time.time(), 'direction': 'upper'})
             elif price['price'] < bb['lower']:
                 if not last_alert['time'] or (time.time() - last_alert['time']) > 300 or last_alert['direction'] != 'lower':
-                    send_alert(f"⚠️ *突破下軌!*\n時間: {price['time'].strftime('%H:%M:%S')}\n價格: `{price['price']}`\n下軌: `{bb['lower']}`")
-                    last_alert.update({'time': time.time(), 'direction': 'lower'})
+                    if send_alert(f"⚠️ *跌破下軌！*\n時間: {price['time'].strftime('%H:%M:%S')}\n價格: `{price['price']}`\n下軌: `{bb['lower']}`"):
+                        last_alert.update({'time': time.time(), 'direction': 'lower'})
 
         time.sleep(CHECK_INTERVAL)
 
 @app.route('/')
 def home():
-    status = "✅ 運行中" if historical_data else "🔄 初始化中"
+    status = "✅ 運行中" if historical_data else "⏳ 初始化中"
     last_update = historical_data[-1]['time'].strftime('%Y-%m-%d %H:%M:%S') if historical_data else "無資料"
-    return f"台指期布林通道監控系統<br>狀態：{status}<br>最後更新：{last_update}"
+    return f"<h2>台指期布林通道監控</h2>狀態：{status}<br>最後更新：{last_update}"
 
 if __name__ == '__main__':
+    import threading
     threading.Thread(target=monitor, daemon=True).start()
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
