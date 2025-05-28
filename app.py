@@ -1,32 +1,24 @@
-import os
-import requests
-import time
-import pandas as pd
 from datetime import datetime, timedelta
 import pytz
+import requests
+import pandas as pd
+import numpy as np
+import time
+import threading
 from flask import Flask
 
-app = Flask(__name__)
-
-# 設定台灣時區
-tz = pytz.timezone('Asia/Taipei')
-
-# Telegram 設定
-TELEGRAM_TOKEN = '7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8'
-TELEGRAM_CHAT_ID = '1190387445'
-
-# FinMind 設定
-FINMIND_TOKEN = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNS0wNS0yOCAwMDo0OToxNiIsInVzZXJfaWQiOiJMdWNpYW4wNzciLCJpcCI6IjExMS4yNTQuMTI5LjIzMSJ9.o90BDk2IcDf0hvbfRrnJTOey4NoMj_WvhTU_Kdto-EU'
-
-# 布林通道參數
-PERIOD = 20
-STD_DEV = 2
+# --- 設定區 ---
+FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNS0wNS0yOCAwMDo0OToxNiIsInVzZXJfaWQiOiJMdWNpYW4wNzciLCJpcCI6IjExMS4yNTQuMTI5LjIzMSJ9.o90BDk2IcDf0hvbfRrnJTOey4NoMj_WvhTU_Kdto-EU"
+TELEGRAM_TOKEN = "7863895518:AAH0avbUgC_yd7RoImzBvQJXFmIrKXjuSj8"
+CHAT_ID = "1190387445"
 CHECK_INTERVAL = 10  # 每 10 秒檢查一次
+tz = pytz.timezone("Asia/Taipei")
 
-# 資料暫存
-historical_data = []
-last_alert = {'direction': None}
+latest_price = None
+latest_update = "初始化中"
+status_lock = threading.Lock()
 
+# --- 函式區 ---
 def get_price():
     try:
         now = datetime.now(tz)
@@ -41,95 +33,89 @@ def get_price():
             'token': FINMIND_TOKEN
         }
 
-        res = requests.get("https://api.finmindtrade.com/api/v4/data", params=payload, timeout=10)
-        data = res.json()
+        response = requests.get('https://api.finmindtrade.com/api/v4/data', params=payload)
+        data = response.json()
 
-        if data.get('status') != 200 or not data.get('data'):
-            print(f"[{now.strftime('%H:%M:%S')}] 無法取得價格: API 無資料")
+        if not data.get('data'):
+            print(f"[{now.strftime('%H:%M:%S')}] 無法取得價格：API 無資料")
             return None
 
         df = pd.DataFrame(data['data'])
-        df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'])
-        df = df.sort_values('datetime').reset_index(drop=True)
-
-        latest_row = df.iloc[-1]
-        return {
-            'time': latest_row['datetime'].tz_localize('Asia/Taipei'),
-            'price': latest_row['close'],
-            'history': df[['datetime', 'close']].rename(columns={'datetime': 'time', 'close': 'price'}).to_dict(orient='records')
-        }
+        df['datetime'] = pd.to_datetime(df['datetime']).dt.tz_localize("UTC").dt.tz_convert(tz)
+        df.set_index('datetime', inplace=True)
+        df = df[['close']].copy()
+        df.columns = ['price']
+        return df
 
     except Exception as e:
         print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] 無法取得價格: {e}")
         return None
 
-def calc_bollinger(prices):
-    series = pd.Series(prices)
-    ma = series.rolling(PERIOD).mean().iloc[-1]
-    std = series.rolling(PERIOD).std().iloc[-1]
-    upper = round(ma + STD_DEV * std, 2)
-    lower = round(ma - STD_DEV * std, 2)
-    return round(ma, 2), upper, lower
+def calc_bollinger(df, window=20, num_std=2):
+    df['MA'] = df['price'].rolling(window=window).mean()
+    df['STD'] = df['price'].rolling(window=window).std()
+    df['Upper'] = df['MA'] + (num_std * df['STD'])
+    df['Lower'] = df['MA'] - (num_std * df['STD'])
+    return df
 
-def send_telegram(msg):
-    try:
-        requests.post(
-            f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
-            json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'},
-            timeout=5
-        )
-        print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] 發送通知成功")
-    except Exception as e:
-        print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] 發送通知失敗: {e}")
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {'chat_id': CHAT_ID, 'text': message}
+    requests.post(url, data=payload)
 
 def monitor():
-    print(f"[{datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')}] 系統啟動中...")
+    global latest_price, latest_update
 
     while True:
-        data = get_price()
-        if not data:
+        df = get_price()
+        if df is None or len(df) < 20:
+            with status_lock:
+                latest_update = "無數據"
             time.sleep(CHECK_INTERVAL)
             continue
 
-        historical_data.clear()
-        historical_data.extend(data['history'])
+        df = calc_bollinger(df)
+        latest = df.iloc[-1]
+        price = latest['price']
+        upper = latest['Upper']
+        lower = latest['Lower']
+        ts = df.index[-1].strftime('%Y-%m-%d %H:%M:%S')
 
-        if len(historical_data) < PERIOD:
-            print(f"[{datetime.now(tz).strftime('%H:%M:%S')}] 初始化資料不足")
-            time.sleep(CHECK_INTERVAL)
-            continue
+        message = None
+        if price > upper:
+            message = f"⚠️ 價格突破上緣！\n時間：{ts}\n價格：{price:.2f}\n上緣：{upper:.2f}"
+        elif price < lower:
+            message = f"⚠️ 價格跌破下緣！\n時間：{ts}\n價格：{price:.2f}\n下緣：{lower:.2f}"
 
-        prices = [d['price'] for d in historical_data][-PERIOD:]
-        ma, upper, lower = calc_bollinger(prices)
-        price = data['price']
-        ts = data['time'].strftime('%Y-%m-%d %H:%M:%S')
+        if message:
+            send_telegram_message(message)
+            print(f"[{ts}] 已發送通知：{message.replace(chr(10), ' | ')}")
+        else:
+            print(f"[{ts}] 價格正常：{price:.2f}，上緣：{upper:.2f}，下緣：{lower:.2f}")
 
-        print(f"\n[{ts}] 現價: {price} | 上軌: {upper} | 中軌: {ma} | 下軌: {lower}")
-
-        if price > upper and last_alert['direction'] != 'upper':
-            send_telegram(f"⚠️ *突破上軌！*\n時間：{ts}\n價格：`{price}`\n上軌：`{upper}`")
-            last_alert['direction'] = 'upper'
-        elif price < lower and last_alert['direction'] != 'lower':
-            send_telegram(f"⚠️ *跌破下軌！*\n時間：{ts}\n價格：`{price}`\n下軌：`{lower}`")
-            last_alert['direction'] = 'lower'
-        elif lower <= price <= upper:
-            last_alert['direction'] = None
+        with status_lock:
+            latest_price = price
+            latest_update = ts
 
         time.sleep(CHECK_INTERVAL)
 
-@app.route('/')
-def home():
-    status = "初始化中" if not historical_data else "運行中"
-    last_time = historical_data[-1]['time'].strftime('%Y-%m-%d %H:%M:%S') if historical_data else "無數據"
-    last_price = historical_data[-1]['price'] if historical_data else "無"
-    return f"""
-    <h2>台指期布林通道監控系統</h2>
-    狀態：{status}<br>
-    最後更新時間：{last_time}<br>
-    最後價格：{last_price}<br>
-    """
+# --- Web 狀態顯示 ---
+app = Flask(__name__)
 
-if __name__ == '__main__':
-    import threading
-    threading.Thread(target=monitor, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 10000)))
+@app.route("/")
+def index():
+    with status_lock:
+        price = f"{latest_price:.2f}" if latest_price else "無"
+        return f"""
+        <h2>台指期布林通道監控系統</h2>
+        <p>狀態：監控中</p>
+        <p>最後更新時間：{latest_update}</p>
+        <p>最後價格：{price}</p>
+        """
+
+# --- 主程式 ---
+if __name__ == "__main__":
+    t = threading.Thread(target=monitor)
+    t.daemon = True
+    t.start()
+    app.run(host="0.0.0.0", port=10000)
